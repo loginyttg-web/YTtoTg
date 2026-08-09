@@ -23,7 +23,7 @@ from config import Config
 from utils.logger import setup_logging
 from utils.helpers import human_bytes
 from core.state import StateManager
-from core.system import cleanup_temp, disk_report, is_disk_alert, folder_size
+from core.system import cleanup_temp, disk_report, is_disk_alert
 from core.downloader import download_worker, get_bot_detection_alerted, reset_bot_alert
 from core.uploader import upload_worker
 from core.auth import bot_detection_help
@@ -76,30 +76,35 @@ async def daily_report_scheduler(app) -> None:
 
 
 async def _send_daily_report(app) -> None:
-    """Compose and send the daily summary."""
+    """Compose and send the daily summary, then reset daily counters."""
     stats = state.stats
 
-    lines = [
-        f"📊 **Daily Summary Report — {datetime.now().strftime('%d %b %Y')}**",
-        "",
-        f"✅ Completed: `{stats['completed']}` videos",
-        f"❌ Failed: `{stats['failed']}` videos",
-        f"⏭️ Skipped: `{stats['skipped']}` videos",
-        f"📦 Total Size Uploaded: `{human_bytes(stats['bytes_uploaded'])}`",
-        f"⏱️ Total Time: `{_fmt_time(stats['total_time'])}`",
-    ]
+    avg_speed = (
+        stats["bytes_uploaded"] / stats["total_time"]
+        if stats.get("total_time", 0) > 0 else 0
+    )
 
-    du = disk_report()
-    lines.append(f"💾 Disk Space: `{du}`")
+    lines = [
+        f"❖ **𝗗𝗮𝗶𝗹𝘆 𝗦𝘂𝗺𝗺𝗮𝗿𝘆 — {datetime.now().strftime('%d %b %Y')}**",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"⋄ ✅ Completed: `{stats['completed']}` videos",
+        f"⋄ ❌ Failed: `{stats['failed']}` videos",
+        f"⋄ ⏭️ Skipped: `{stats['skipped']}` videos",
+        f"⋄ 📦 Uploaded: `{human_bytes(stats['bytes_uploaded'])}`",
+        f"⋄ ⏱️ Upload time: `{_fmt_time(stats['total_time'])}`",
+        f"⋄ ⚡ Avg speed: `{human_bytes(avg_speed)}/s`",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
 
     # Failed videos list
     failed = stats.get("failed_list", [])
     if failed:
-        lines.append("\n**Failed Videos:**")
+        lines.append("**❌ Failed Videos:**")
         for i, fv in enumerate(failed[-10:], 1):
             title = fv.get("title", "Unknown")
             error = fv.get("error", "")
             lines.append(f"{i}. \"{title}\" — `{error[:80]}`")
+        lines.append("_→ /retryfailed to re-queue_")
 
     try:
         await app.send_message(
@@ -107,6 +112,8 @@ async def _send_daily_report(app) -> None:
             text="\n".join(lines),
         )
         logger.info("Daily report sent")
+        # Fresh counters for the next day
+        state.reset_daily_stats()
     except Exception as exc:
         logger.error("Failed to send daily report: %s", exc)
 

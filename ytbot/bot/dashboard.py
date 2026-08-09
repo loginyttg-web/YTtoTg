@@ -1,11 +1,16 @@
 """
-Live dashboard — compact box-style UI.
-╭── 🟢 ACTIVE │ ⬇3 ⬆1 │ ↓31 MB/s ↑9 MB/s │ 💾 253 GB ──╮
-│ 📊 55.1% (125/227) │ ✓ 124  ✗ 1  ⏳ 102 Pending        │
-├────────────────────────────────────────────────────────────┤
-│ ⬇ [■■■■■■■■□□  82%] Math Mock Test   612/742MB 18MB/s 7s  │
-│ ⬆ [■■■■■■■□□□  67%] Physics Marathon 498/742MB  9MB/s 19s │
-╰────────────────────────────────────────────────────────────╯
+Live dashboard — clean box UI with smooth gradient progress bars.
+
+╭─────────────────── 🟢 ACTIVE ───────────────────╮
+│ ⬇2  ⬆1   ↓31.2MB/s 🚀  ↑9.1MB/s 🐇   💾 253GB  │
+│ Queue ██████████▏─────────  51%  ·  125/227     │
+│ ✓ 124   ✗ 1   ⏳ 101 pending                    │
+├─────────────────────────────────────────────────┤
+│ ⬇ Math Mock Test #4                             │
+│   ████████▏───  68%  504/742MB · 18MB/s · 13s   │
+│ ⬆ Physics Marathon                              │
+│   ██████▎─────  53%  392/742MB · 9MB/s · 39s    │
+╰───────────── ↑ 1.2GB sent · 12m run ────────────╯
 """
 
 from __future__ import annotations
@@ -24,7 +29,10 @@ from core.downloader import progress_registry, _registry_lock
 from core.uploader import upload_progress, _uplock
 from core.state import StateManager, DOWNLOADED
 from core.system import disk_usage, is_disk_alert
-from utils.helpers import human_bytes, human_time_short, short, speed_str
+from utils.helpers import (
+    human_bytes, human_time_short, short, speed_str_compact, speed_tier,
+    bar_smooth, strip_md,
+)
 from bot.keyboards import kb_processing
 
 logger = logging.getLogger("dashboard")
@@ -35,8 +43,10 @@ _session_start: float = time.time()
 _session_bytes: int   = 0
 _last_text: str       = ""
 
-# Inner width between │ chars — 62 chars fits most Telegram mobile screens
-W = 62
+# Inner width between │ chars — fits Telegram mobile monospace rendering
+W = 54
+
+BAR_W = 12  # progress-bar width (chars)
 
 
 def set_session_bytes(n: int) -> None:
@@ -67,32 +77,22 @@ def _top(inner: str) -> str:
     return "╭" + "─" * left + inner + "─" * right + "╮"
 
 
-def _bot() -> str:
-    return "╰" + "─" * W + "╯"
-
-
-def _bar(done: float, total: float) -> str:
-    """[■■■■■□□□□□  50%] — always 17 chars wide."""
-    if total <= 0:
-        return "[□□□□□□□□□□   0%]"
-    p = int(min(done / total, 1.0) * 100)
-    f = min(p // 10, 10)
-    return f"[{'■' * f}{'□' * (10 - f)} {p:3d}%]"
+def _bot(inner: str = "") -> str:
+    """╰── <inner> ──╯ bottom edge, optionally with centred text."""
+    if not inner:
+        return "╰" + "─" * W + "╯"
+    pad   = max(0, W - len(inner))
+    left  = pad // 2
+    right = pad - left
+    return "╰" + "─" * left + inner + "─" * right + "╯"
 
 
 def _spd(bps: float) -> str:
-    """Compact speed without space: 18MB/s."""
-    if bps <= 0:
-        return "—"
-    if bps >= 1_000_000:
-        return f"{bps / 1_000_000:.1f}MB/s"
-    if bps >= 1_000:
-        return f"{bps / 1_000:.0f}KB/s"
-    return f"{bps:.0f}B/s"
+    return speed_str_compact(bps)
 
 
 def _eta(secs: float) -> str:
-    return human_time_short(secs) if secs > 0 else "—"
+    return human_time_short(secs) if secs and secs > 0 else "—"
 
 
 def _sz(done: float, total: float) -> str:
@@ -100,6 +100,21 @@ def _sz(done: float, total: float) -> str:
     d = human_bytes(done, True).replace(" ", "")
     t = human_bytes(total, True).replace(" ", "")
     return f"{d}/{t}"
+
+
+def _task_bar_row(done: float, total: float, speed: float, eta: float,
+                  extra: str = "") -> str:
+    """`  ████████▏───  68%  504/742MB · 18MB/s · 13s`"""
+    if total > 0:
+        pct = int(min(done / total, 1.0) * 100)
+        seg = f"{_sz(done, total)} · {_spd(speed)} · {_eta(eta)}"
+    else:
+        pct = 0
+        seg = "Starting…"
+    if extra:
+        seg = f"{seg} {extra}"
+    bar = bar_smooth(done, total, BAR_W)
+    return f"  {bar} {pct:>3d}%  {seg}"
 
 
 # ── Main formatter ─────────────────────────────────────────────────────────────
@@ -114,7 +129,7 @@ def format_dashboard(state: StateManager) -> str:
     dl_count  = counts["downloading"]
     up_count  = counts["uploading"]
     total     = counts["total"]
-    done      = completed + failed + skipped
+    done      = completed + failed + skipped + counts.get("cancelled", 0)
 
     with _registry_lock:
         active_dl = dict(progress_registry)
@@ -127,45 +142,52 @@ def format_dashboard(state: StateManager) -> str:
     du      = disk_usage()
     free_gb = du["free"] / 1_073_741_824  # bytes → GB
 
-    # ── Status ──────────────────────────────────────────────────────────────
+    # ── Status pill ─────────────────────────────────────────────────────────
     if paused:
         status = "⏸ PAUSED"
     elif dl_count + up_count > 0:
         status = "🟢 ACTIVE"
+    elif pending > 0:
+        status = "🟡 STARTING"
     else:
         status = "💤 IDLE"
 
-    # ── Header row ──────────────────────────────────────────────────────────
-    # Keep it compact; dashes fill the remaining width
-    hdr = (
-        f" {status} │ ⬇{dl_count} ⬆{up_count}"
-        f" │ ↓{_spd(dl_speed)} ↑{_spd(ul_speed)}"
-        f" │ 💾 {free_gb:.1f}GB "
-    )
-    lines = [_top(hdr)]
+    # ── Header ──────────────────────────────────────────────────────────────
+    lines = [_top(f" {status} ")]
 
-    # ── Stats row ───────────────────────────────────────────────────────────
+    speed_bits = []
+    if dl_speed > 0:
+        speed_bits.append(f"↓{_spd(dl_speed)} {speed_tier(dl_speed)}")
+    if ul_speed > 0:
+        speed_bits.append(f"↑{_spd(ul_speed)} {speed_tier(ul_speed)}")
+    speed_txt = "  ".join(speed_bits) if speed_bits else "↓—  ↑—"
+
+    lines.append(_row(f" ⬇{dl_count}  ⬆{up_count}   {speed_txt}   💾 {free_gb:.0f}GB free"))
+
+    # ── Queue overview ──────────────────────────────────────────────────────
     if total > 0:
         pct_val = done * 100 / total
-        stats = (
-            f" 📊 {pct_val:.1f}% ({done}/{total})"
-            f" │ ✓ {completed}  ✗ {failed}  ⏳ {pending} Pending"
-        )
+        qbar    = bar_smooth(done, total, 16)
+        lines.append(_row(f" Queue {qbar} {pct_val:>3.0f}% · {done}/{total}"))
+        lines.append(_row(
+            f" ✓ {completed}   ✗ {failed}   ⏳ {pending} pending"
+            + (f"   ⏭ {skipped}" if skipped else "")
+        ))
     else:
-        stats = " 📊 Idle — send a YouTube link to start"
-    lines.append(_row(stats))
+        lines.append(_row(" Queue is empty — send a YouTube link 🎬"))
 
-    # ── Per-task rows ────────────────────────────────────────────────────────
+    # ── Per-task rows ───────────────────────────────────────────────────────
     task_rows: list[str] = []
 
     # Active downloads (from downloader progress registry)
     for tid, d in list(active_dl.items())[:4]:
         task  = state.get(tid)
-        name  = short(task.title, 18) if task else tid[:12]
-        stage = d.get("stage", "downloading")
+        name  = strip_md(short(task.title, 34) if task else tid[:12])
 
+        stage = d.get("stage", "downloading")
         if stage == "postprocessing":
-            task_rows.append(f" ⬇ [■■■■■■■■■■ 100%] {name}  Merging…")
+            task_rows.append(f" ⬇ {name}")
+            task_rows.append(f"  {'█' * BAR_W} 100%  Merging / converting…")
             continue
 
         dtot  = d.get("total", 0)
@@ -173,57 +195,53 @@ def format_dashboard(state: StateManager) -> str:
         spd   = d.get("speed", 0)
         eta   = d.get("eta", 0)
 
-        bar = _bar(ddone, dtot)
-        if dtot > 0:
-            info = f"{_sz(ddone, dtot)} {_spd(spd)} {_eta(eta)}"
-            task_rows.append(f" ⬇ {bar} {name}  {info}")
-        else:
-            task_rows.append(f" ⬇ {bar} {name}  Starting…")
+        task_rows.append(f" ⬇ {name}")
+        task_rows.append(_task_bar_row(ddone, dtot, spd, eta))
 
-    # Downloaded (waiting to upload) — not actively uploading yet
+    # Downloaded, waiting for upload
     uploading_ids = set(up_active.keys())
     queued = [t for t in state.by_status(DOWNLOADED) if t.id not in uploading_ids]
     for t in queued[:3]:
-        name = short(t.title, 18)
+        name = strip_md(short(t.title, 34))
         sz   = human_bytes(t.filesize, True).replace(" ", "") if t.filesize else "?"
-        task_rows.append(f" ⬇ [■■■■■■■■■■ 100%] {name}  {sz} ✓ Queued")
+        task_rows.append(f" ✓ {name}")
+        task_rows.append(f"  {'█' * BAR_W} 100%  {sz} · waiting to upload")
 
     # Active upload(s)
     for tid, d in list(up_active.items())[:2]:
-        task  = state.get(tid)
-        name  = short(task.title, 18) if task else tid[:12]
-        utot  = d.get("total", 0)
-        ucur  = d.get("current", 0)
-        spd   = d.get("speed", 0)
-        eta   = d.get("eta", 0)
-        part  = d.get("part", "1/1")
+        task = state.get(tid)
+        name = strip_md(short(task.title, 34) if task else tid[:12])
+        utot = d.get("total", 0)
+        ucur = d.get("current", 0)
+        spd  = d.get("speed", 0)
+        eta  = d.get("eta", 0)
+        part = d.get("part", "1/1")
+        extra = f"· P{part}" if part != "1/1" else ""
 
-        bar = _bar(ucur, utot)
-        if utot > 0:
-            pt   = f" P{part}" if part != "1/1" else ""
-            info = f"{_sz(ucur, utot)} {_spd(spd)} {_eta(eta)}{pt}"
-            task_rows.append(f" ⬆ {bar} {name}  {info}")
-        else:
-            task_rows.append(f" ⬆ {bar} {name}  Starting…")
+        task_rows.append(f" ⬆ {name}")
+        task_rows.append(_task_bar_row(ucur, utot, spd, eta, extra))
 
     if task_rows:
         lines.append(_sep())
         for row in task_rows:
             lines.append(_row(row))
 
-    # ── Bottom ──────────────────────────────────────────────────────────────
-    lines.append(_bot())
+    # ── Footer — session totals ─────────────────────────────────────────────
+    sent_bytes = state.stats.get("bytes_uploaded", 0)
+    run_secs   = time.time() - _session_start
+    foot = f" ↑ {human_bytes(sent_bytes, True)} sent · {human_time_short(run_secs)} run "
+    lines.append(_bot(foot))
 
-    # ── Alerts outside the box (plain text) ─────────────────────────────────
+    # ── Alerts (outside the box) ────────────────────────────────────────────
     alerts: list[str] = []
     if is_disk_alert():
-        alerts.append("⚠️ Low disk — run /clear")
+        alerts.append(f"⚠️ Disk {du['percent']:.0f}% full — free space or run /clear")
     if failed > 0 and dl_count == 0 and up_count == 0 and pending == 0:
-        alerts.append(f"❌ {failed} failed — /resetqueue to clear")
+        alerts.append(f"❌ {failed} failed — /retryfailed to re-queue")
 
     box = "```\n" + "\n".join(lines) + "\n```"
     if alerts:
-        box += "\n" + "  ".join(alerts)
+        box += "\n" + "\n".join(alerts)
     return box
 
 
@@ -251,7 +269,7 @@ async def dashboard_loop(app: Client, stop_event: asyncio.Event, state: StateMan
             continue
 
         text   = format_dashboard(state)
-        markup = kb_processing()
+        markup = kb_processing(paused=state.settings.get("paused", False))
 
         if text == _last_text and dashboard_msg_id:
             continue

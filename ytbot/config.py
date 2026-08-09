@@ -36,10 +36,10 @@ QUALITY_MAP = {
 }
 
 QUALITY_LABELS = {
-    "best": "📊 Best",
-    "1080": "📺 1080p",
+    "best": "⭐ Best",
+    "1080": "🎬 1080p",
     "720": "📺 720p",
-    "480": "📺 480p",
+    "480": "📱 480p",
     "audio": "🎵 Audio",
 }
 

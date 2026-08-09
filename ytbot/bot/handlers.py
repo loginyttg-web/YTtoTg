@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
 import time
 from typing import Optional
 
@@ -15,16 +16,23 @@ from pyrogram.types import Message, CallbackQuery
 
 from config import Config, quality_label
 from core.scraper import scan, sort_items, generate_txt
-from core.state import StateManager, PENDING, COMPLETED, FAILED, CANCELLED, SKIPPED
-from core.system import disk_report as sys_disk_report, server_report as sys_server_report
+from core.state import StateManager, PENDING
+from core.system import (
+    disk_report as sys_disk_report,
+    server_report as sys_server_report,
+    run_speedtest,
+)
 from core.auth import auth_status, bot_detection_help
-from core.downloader import get_bot_detection_alerted, reset_bot_alert, trigger_cancel
+from core.downloader import reset_bot_alert, trigger_cancel
 from utils.helpers import (
-    human_bytes, human_time, human_time_short, short, parse_video_id, classify_url,
-    sanitize_filename, progress_bar, speed_str, SEP,
+    human_bytes, human_time, short, parse_video_id, classify_url,
+    styled_progress_bar, bar_smooth, SEP,
 )
 from utils.logger import tail_log
-from bot.keyboards import kb_sort, kb_quality, kb_processing, kb_confirm, kb_start, kb_tasks_page, kb_video, kb_channels
+from bot.keyboards import (
+    kb_sort, kb_quality, kb_processing, kb_confirm, kb_start,
+    kb_tasks_page, kb_video, kb_channels,
+)
 
 logger = logging.getLogger("handlers")
 
@@ -66,46 +74,55 @@ owner_filter = filters.create(owner_only)
 YT_PATTERN = r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/(watch\?v=|[a-zA-Z0-9_-]{11}|@[a-zA-Z0-9_.-]+|playlist\?list=|channel/|c/|shorts/)"
 
 def yt_url(_, __, msg: Message) -> bool:
-    import re
     return bool(re.search(YT_PATTERN, msg.text or ""))
 
 yt_filter = filters.create(yt_url)
 
+ACTIVE_STATUSES = ("pending", "downloading", "downloaded", "uploading")
+
+
+def _ordered_tasks():
+    """All tasks, active first (in queue order)."""
+    tasks = state.all_tasks()
+    active = [t for t in tasks if t.status in ACTIVE_STATUSES]
+    other  = [t for t in tasks if t.status not in ACTIVE_STATUSES]
+    return active, other
+
 
 # ---------------------------------------------------------------------------
-# /start
+# /start  &  /help
 # ---------------------------------------------------------------------------
 
-@Client.on_message(filters.command("start") & owner_filter)
+START_TEXT = (
+    "❖ **𝗬𝗧 ➜ 𝗧𝗲𝗹𝗲𝗴𝗿𝗮𝗺 𝗕𝗮𝗰𝗸𝘂𝗽 𝗕𝗼𝘁**\n"
+    f"{SEP}\n"
+    "Send any YouTube link and I'll back it up:\n"
+    "🎬 Single video · 📋 Playlist · 📺 Channel\n\n"
+    "**📥 Queue**\n"
+    "`/status` live overview · `/tasks` task list\n"
+    "`/dashboard` live progress panel\n"
+    "`/cancel <id|url>` cancel one task\n"
+    "`/pause` · `/resume` pause / resume all\n"
+    "`/resetqueue` cancel all active tasks\n"
+    "`/clear` remove finished tasks\n"
+    "`/retryfailed` re-queue failed tasks\n\n"
+    "**⚙️ Settings**\n"
+    "`/setquality <best|1080|720|480|audio>`\n"
+    "`/setparallel <1-5>` parallel workers\n"
+    "`/setchannel [id]` · `/channels` · `/destinfo`\n\n"
+    "**🖥 System**\n"
+    "`/serverinfo` · `/diskspace` · `/speedtest`\n"
+    "`/stats` session stats · `/logs [n|level]`\n"
+    "`/purge <n>` delete last N uploads\n\n"
+    "**🔐 Auth**\n"
+    "`/cookies` upload cookies.txt\n"
+    "`/authstatus` · `/ytdlpupdate`"
+)
+
+
+@Client.on_message(filters.command(["start", "help"]) & owner_filter)
 async def cmd_start(client: Client, message: Message):
-    await message.reply(
-        f"❖ **𝗬𝗧 𝗕𝗮𝗰𝗸𝘂𝗽 𝗕𝗼𝘁**\n"
-        f"{SEP}\n"
-        f"Send a YouTube link to begin:\n"
-        f"⋄ Single video  ⋄ Playlist  ⋄ Channel\n\n"
-        f"**📋 Queue**\n"
-        f"`/status` — queue overview\n"
-        f"`/tasks` — list tasks\n"
-        f"`/cancel <id>` — cancel a task\n"
-        f"`/pause` · `/resume` — pause / resume\n"
-        f"`/clear` — remove finished tasks\n"
-        f"`/resetqueue` — cancel all active\n"
-        f"`/setparallel <1-5>` — parallel workers\n\n"
-        f"**🖥 System**\n"
-        f"`/diskspace` — disk usage\n"
-        f"`/serverinfo` — CPU, RAM, uptime\n"
-        f"`/logs` — last 40 log lines\n"
-        f"`/purge <n>` — delete last N messages\n\n"
-        f"**📍 Destination**\n"
-        f"`/setchannel [chat_id]` — set upload destination\n"
-        f"`/channels` — saved destinations, tap to switch\n"
-        f"`/destinfo` — current destination\n\n"
-        f"**🔐 Auth**\n"
-        f"`/cookies` — upload cookies.txt\n"
-        f"`/authstatus` — auth state\n"
-        f"`/ytdlpupdate` — update yt-dlp",
-        reply_markup=kb_start(),
-    )
+    await message.reply(START_TEXT, reply_markup=kb_start())
 
 
 # ---------------------------------------------------------------------------
@@ -117,30 +134,30 @@ async def cmd_status(client: Client, message: Message):
     c      = state.counts()
     paused = state.settings.get("paused", False)
     pq     = state.settings["parallel_downloads"]
+    q      = state.settings.get("quality", "best")
     total  = c["total"]
     done   = c["completed"] + c["failed"] + c["skipped"] + c["cancelled"]
 
-    dot    = "⏸" if paused else "🟢"
-    stat   = "𝗣𝗔𝗨𝗦𝗘𝗗" if paused else "𝗥𝗨𝗡𝗡𝗜𝗡𝗚"
+    dot  = "⏸" if paused else "🟢"
+    stat = "𝗣𝗔𝗨𝗦𝗘𝗗" if paused else "𝗥𝗨𝗡𝗡𝗜𝗡𝗚"
 
     if total > 0:
-        from utils.helpers import styled_progress_bar
-        pct  = int(done * 100 / total)
-        bar  = styled_progress_bar(done, total, 14)
+        pct = int(done * 100 / total)
+        bar = styled_progress_bar(done, total, 14)
         summary = f"`{bar}` **{pct}%**  `{done}/{total}`"
     else:
-        summary = "_Queue is empty_"
+        summary = "_Queue is empty — send a YouTube link_"
 
     text = (
         f"❖ **𝗤𝘂𝗲𝘂𝗲 𝗦𝘁𝗮𝘁𝘂𝘀**\n"
         f"{SEP}\n"
-        f"{dot} {stat}  |  ⚡ {pq} workers\n\n"
+        f"{dot} {stat}   ⚡ `{pq}` workers   🎞 {quality_label(q)}\n\n"
         f"{summary}\n\n"
-        f"✅ `{c['completed']}`  ❌ `{c['failed']}`  ⏳ `{c['pending']}`\n"
-        f"⬇ `{c['downloading']}`  📤 `{c['uploading']}`  🚫 `{c['cancelled']}`\n"
+        f"✅ `{c['completed']}`   ❌ `{c['failed']}`   ⏳ `{c['pending']}`\n"
+        f"⬇️ `{c['downloading']}`   📤 `{c['uploading']}`   🚫 `{c['cancelled']}`\n"
         f"{SEP}"
     )
-    await message.reply(text, reply_markup=kb_processing())
+    await message.reply(text, reply_markup=kb_processing(paused))
 
 
 # ---------------------------------------------------------------------------
@@ -149,27 +166,80 @@ async def cmd_status(client: Client, message: Message):
 
 @Client.on_message(filters.command("tasks") & owner_filter)
 async def cmd_tasks(client: Client, message: Message):
-    tasks = state.all_tasks()
-    active_tasks = [t for t in tasks if t.status in ("pending", "downloading", "downloaded", "uploading")]
-    other_tasks  = [t for t in tasks if t.status not in ("pending", "downloading", "downloaded", "uploading")]
-    ordered      = active_tasks + other_tasks
+    active_t, other_t = _ordered_tasks()
+    ordered = active_t + other_t
 
     if not ordered:
         await message.reply("_Queue is empty._")
         return
 
-    total = len(ordered)
-    text  = (
+    text = (
         f"❖ **𝗧𝗮𝘀𝗸 𝗟𝗶𝘀𝘁**\n"
         f"{SEP}\n"
-        f"⋄ Active: `{len(active_tasks)}`  |  Total: `{total}`\n"
-        f"_Tap ❌ to cancel a task_"
+        f"⋄ Active: `{len(active_t)}`  ·  Total: `{len(ordered)}`\n"
+        f"_Tap ℹ️ for details · ❌ to cancel_"
     )
     await message.reply(text, reply_markup=kb_tasks_page(ordered, page=0))
 
 
 # ---------------------------------------------------------------------------
-# /diskspace
+# /dashboard — pin the live progress panel in this chat
+# ---------------------------------------------------------------------------
+
+@Client.on_message(filters.command("dashboard") & owner_filter)
+async def cmd_dashboard(client: Client, message: Message):
+    from bot import dashboard as dash_mod
+
+    paused = state.settings.get("paused", False)
+    text   = dash_mod.format_dashboard(state)
+    msg    = await message.reply(text, reply_markup=kb_processing(paused))
+
+    # Retarget the background dashboard loop to this message
+    dash_mod.dashboard_msg_id   = msg.id
+    dash_mod._dashboard_chat_id = message.chat.id
+    dash_mod._last_text         = text
+
+
+# ---------------------------------------------------------------------------
+# /stats — session statistics
+# ---------------------------------------------------------------------------
+
+@Client.on_message(filters.command("stats") & owner_filter)
+async def cmd_stats(client: Client, message: Message):
+    await message.reply(_stats_text())
+
+
+def _stats_text() -> str:
+    stats = state.stats
+    c     = state.counts()
+
+    up_bytes = stats.get("bytes_uploaded", 0)
+    up_time  = stats.get("total_time", 0.0)
+    avg_spd  = (up_bytes / up_time) if up_time > 0 else 0
+
+    from bot import dashboard as dash_mod
+    run_secs = time.time() - dash_mod._session_start
+
+    bar = bar_smooth(stats.get("completed", 0),
+                     max(c["total"], 1), 14)
+
+    return (
+        f"❖ **𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗦𝘁𝗮𝘁𝘀**\n"
+        f"{SEP}\n"
+        f"`{bar}`\n\n"
+        f"⋄ ✅ Completed: `{stats.get('completed', 0)}`\n"
+        f"⋄ ❌ Failed: `{stats.get('failed', 0)}`\n"
+        f"⋄ ⏭ Skipped: `{stats.get('skipped', 0)}`\n"
+        f"⋄ 📦 Uploaded: `{human_bytes(up_bytes)}`\n"
+        f"⋄ ⏱ Upload time: `{human_time(up_time)}`\n"
+        f"⋄ ⚡ Avg upload speed: `{human_bytes(avg_spd)}/s`\n"
+        f"⋄ 🕐 Bot running: `{human_time(run_secs)}`\n"
+        f"{SEP}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# /diskspace  &  /serverinfo
 # ---------------------------------------------------------------------------
 
 @Client.on_message(filters.command("diskspace") & owner_filter)
@@ -177,29 +247,40 @@ async def cmd_diskspace(client: Client, message: Message):
     await message.reply(sys_disk_report())
 
 
-# ---------------------------------------------------------------------------
-# /serverinfo
-# ---------------------------------------------------------------------------
-
 @Client.on_message(filters.command("serverinfo") & owner_filter)
 async def cmd_serverinfo(client: Client, message: Message):
     await message.reply(sys_server_report())
 
 
 # ---------------------------------------------------------------------------
-# /logs
+# /speedtest
+# ---------------------------------------------------------------------------
+
+@Client.on_message(filters.command("speedtest") & owner_filter)
+async def cmd_speedtest(client: Client, message: Message):
+    wait_msg = await message.reply("🌐 _Running speed test (25 MB download)…_")
+    result   = await run_speedtest()
+    await wait_msg.edit(result)
+
+
+# ---------------------------------------------------------------------------
+# /logs [lines|level]
 # ---------------------------------------------------------------------------
 
 @Client.on_message(filters.command("logs") & owner_filter)
 async def cmd_logs(client: Client, message: Message):
-    args         = message.text.split(maxsplit=1)
+    args         = message.text.split()[1:]
     level_filter = None
-    if len(args) > 1:
-        lvl = args[1].strip().upper()
-        if lvl in ("ERROR", "WARNING", "WARN", "INFO", "DEBUG"):
-            level_filter = lvl if lvl != "WARN" else "WARNING"
+    lines        = 40
 
-    log_text = tail_log(Config.DATA_DIR, lines=40, level=level_filter)
+    for tok in args:
+        tok = tok.strip()
+        if tok.upper() in ("ERROR", "WARNING", "WARN", "INFO", "DEBUG"):
+            level_filter = tok.upper() if tok.upper() != "WARN" else "WARNING"
+        elif tok.isdigit():
+            lines = min(max(int(tok), 1), 200)
+
+    log_text = tail_log(Config.DATA_DIR, lines=lines, level=level_filter)
     label    = f" (filter: {level_filter})" if level_filter else ""
 
     if len(log_text) <= 3800:
@@ -219,10 +300,10 @@ async def cmd_cookies(client: Client, message: Message):
     await message.reply(
         f"❖ **𝗨𝗽𝗹𝗼𝗮𝗱 𝗖𝗼𝗼𝗸𝗶𝗲𝘀**\n"
         f"{SEP}\n"
-        f"1. Install _Get cookies.txt LOCALLY_ extension\n"
-        f"2. Open YouTube while logged in\n"
-        f"3. Export `cookies.txt` from the extension\n"
-        f"4. **Reply to this message** with the file\n\n"
+        f"1️⃣ Install _Get cookies.txt LOCALLY_ extension\n"
+        f"2️⃣ Open YouTube while logged in\n"
+        f"3️⃣ Export `cookies.txt` from the extension\n"
+        f"4️⃣ **Reply to this message** with the file\n\n"
         f"⚠️ File must be named `cookies.txt`"
     )
 
@@ -279,7 +360,9 @@ async def on_cookies_upload(client: Client, message: Message):
 async def cmd_authstatus(client: Client, message: Message):
     s         = auth_status()
     help_text = bot_detection_help() if "No auth" in s else ""
-    await message.reply(f"**Auth Status**\n\n{s}\n\n{help_text}".strip())
+    await message.reply(
+        f"❖ **𝗔𝘂𝘁𝗵 𝗦𝘁𝗮𝘁𝘂𝘀**\n{SEP}\n{s}\n\n{help_text}".rstrip()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -290,11 +373,11 @@ async def cmd_authstatus(client: Client, message: Message):
 async def cmd_ytdlpupdate(client: Client, message: Message):
     import subprocess
     import sys
-    wait_msg = await message.reply("⏳ Updating yt-dlp…")
+    wait_msg = await message.reply("⏳ _Updating yt-dlp…_")
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=180,
         )
         if result.returncode == 0:
             import importlib
@@ -327,10 +410,10 @@ async def cmd_purge(client: Client, message: Message):
     n = min(max(n, 1), 500)
     from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     await message.reply(
-        f"🗑 Delete last **{n}** messages?",
+        f"🗑 Delete last **{n}** uploaded messages from the destination chat?",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✓ Yes", callback_data=f"purge_confirm_{n}"),
-            InlineKeyboardButton("✕ Cancel", callback_data="confirm_no"),
+            InlineKeyboardButton("✅ Yes", callback_data=f"purge_confirm_{n}"),
+            InlineKeyboardButton("✖️ Cancel", callback_data="confirm_no"),
         ]]),
     )
 
@@ -347,8 +430,11 @@ async def cmd_resetqueue(client: Client, message: Message):
         await message.reply("_Queue is already empty._")
         return
     active = counts["pending"] + counts["downloading"] + counts["downloaded"] + counts["uploading"]
+    if active == 0:
+        await message.reply("_No active tasks. Use `/clear` to remove finished ones._")
+        return
     await message.reply(
-        f"⚠️ Cancel all **{active}** active tasks?\n_(failed/completed stay in log)_",
+        f"⚠️ Cancel all **{active}** active tasks?\n_(completed/failed stay in the log)_",
         reply_markup=kb_confirm("resetqueue"),
     )
 
@@ -361,14 +447,20 @@ async def cmd_resetqueue(client: Client, message: Message):
 async def cmd_pause(client: Client, message: Message):
     state.settings["paused"] = True
     state.mark_dirty()
-    await message.reply("⏸ **Paused** — `/resume` to continue.")
+    await message.reply(
+        "⏸ **Paused.**\nDownloads & uploads on hold — `/resume` to continue.",
+        reply_markup=kb_processing(paused=True),
+    )
 
 
 @Client.on_message(filters.command("resume") & owner_filter)
 async def cmd_resume(client: Client, message: Message):
     state.settings["paused"] = False
     state.mark_dirty()
-    await message.reply("▶️ **Resumed.**")
+    await message.reply(
+        "▶️ **Resumed.** Back to work!",
+        reply_markup=kb_processing(paused=False),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +510,61 @@ async def cmd_setparallel(client: Client, message: Message):
         return
     state.settings["parallel_downloads"] = n
     state.mark_dirty()
-    await message.reply(f"⚡ Parallel downloads → `{n}`")
+    await message.reply(f"⚡ Parallel downloads → `{n}` workers")
+
+
+# ---------------------------------------------------------------------------
+# /setquality  &  /quality
+# ---------------------------------------------------------------------------
+
+VALID_QUALITIES = ("best", "1080", "720", "480", "audio")
+
+
+@Client.on_message(filters.command(["setquality", "quality"]) & owner_filter)
+async def cmd_setquality(client: Client, message: Message):
+    args = message.text.split()
+    current = state.settings.get("quality", "best")
+
+    if len(args) < 2:
+        await message.reply(
+            f"❖ **𝗩𝗶𝗱𝗲𝗼 𝗤𝘂𝗮𝗹𝗶𝘁𝘆**\n"
+            f"{SEP}\n"
+            f"Current: {quality_label(current)}\n"
+            f"_Pick a quality — applies to new tasks_",
+            reply_markup=kb_quality(current),
+        )
+        return
+
+    q = args[1].strip().lower()
+    if q not in VALID_QUALITIES:
+        await message.reply(
+            f"❌ Unknown quality `{q}`.\nChoose from: `{'`, `'.join(VALID_QUALITIES)}`"
+        )
+        return
+
+    state.settings["quality"] = q
+    state.mark_dirty()
+    await message.reply(
+        f"🎞 Quality set → {quality_label(q)}\n_Applies to newly added tasks._",
+        reply_markup=kb_quality(q),
+    )
+
+
+# ---------------------------------------------------------------------------
+# /retryfailed
+# ---------------------------------------------------------------------------
+
+@Client.on_message(filters.command("retryfailed") & owner_filter)
+async def cmd_retryfailed(client: Client, message: Message):
+    counts = state.counts()
+    if counts.get("failed", 0) == 0:
+        await message.reply("_No failed tasks to retry._ ✅")
+        return
+    n = state.retry_failed()
+    await message.reply(
+        f"🔁 Re-queued **{n}** failed task{'s' if n != 1 else ''}.\n"
+        f"They'll start automatically — `/status` to watch."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -532,9 +678,9 @@ async def cmd_destinfo(client: Client, message: Message):
     await message.reply(
         f"📍 **Current Destination**\n"
         f"{SEP}\n"
-        f"⋄ 𝗜𝗗: `{dest_id}`\n"
-        f"⋄ 𝗡𝗮𝗺𝗲: {dest_title}\n"
-        f"Use `/setchannel` to change it, or `/channels` to pick from saved ones."
+        f"⋄ 𝗡𝗮𝗺𝗲: **{dest_title}**\n"
+        f"⋄ 𝗜𝗗: `{dest_id}`\n\n"
+        f"`/setchannel` to change · `/channels` to pick from saved."
     )
 
 
@@ -550,7 +696,7 @@ async def cmd_clear(client: Client, message: Message):
         await message.reply("_No finished tasks to clear._")
         return
     await message.reply(
-        f"🗑 Clear `{finished}` finished tasks?",
+        f"🗑 Clear `{finished}` finished tasks from the list?",
         reply_markup=kb_confirm("clear"),
     )
 
@@ -684,7 +830,7 @@ async def _handle_video(client: Client, message: Message, url: str):
         f"{SEP}\n"
         f"⋄ 𝗖𝗵𝗮𝗻𝗻𝗲𝗹: {channel}\n"
         f"⋄ 𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻: `{dur}`\n"
-        f"⋄ 𝗤𝘂𝗮𝗹𝗶𝘁𝘆: `{q_label}`\n"
+        f"⋄ 𝗤𝘂𝗮𝗹𝗶𝘁𝘆: {q_label}\n"
         f"{SEP}\n"
         f"_Select quality or tap Start_",
         reply_markup=kb_video(),
@@ -745,12 +891,34 @@ async def _handle_scan(client: Client, message: Message, url: str, kind: str):
     await status_msg.edit(
         f"{icon} **{channel or kind.title()}**\n"
         f"{SEP}\n"
-        f"⋄ Videos: `{len(items)}`\n"
-        f"⋄ Quality: `{q_label}`\n"
+        f"⋄ 𝗩𝗶𝗱𝗲𝗼𝘀: `{len(items)}`\n"
+        f"⋄ 𝗤𝘂𝗮𝗹𝗶𝘁𝘆: {q_label}\n"
         f"{SEP}\n"
         f"_Pick sort order & quality, then Start_",
         reply_markup=kb_sort(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Callback helpers
+# ---------------------------------------------------------------------------
+
+async def _refresh_dashboard_msg(cq: CallbackQuery) -> None:
+    """Re-render the dashboard/status message a button lives on."""
+    from bot import dashboard as dash_mod
+    paused = state.settings.get("paused", False)
+    try:
+        txt = (cq.message.text or "")
+        if "╭" in txt:  # live dashboard box → full re-render
+            await cq.message.edit(
+                dash_mod.format_dashboard(state),
+                reply_markup=kb_processing(paused),
+            )
+            dash_mod._last_text = ""
+        else:
+            await cq.message.edit_reply_markup(kb_processing(paused))
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -791,18 +959,26 @@ async def on_callback(client: Client, cq: CallbackQuery):
     elif data.startswith("quality_"):
         q = data.replace("quality_", "")
         if q == "back":
-            # Go back to correct keyboard depending on cached kind
+            # Go back to the correct keyboard depending on context
             cached = _scanned_items_cache.get(chat_id)
-            kind   = (cached or {}).get("kind", "playlist")
-            if kind == "video":
-                await cq.message.edit_reply_markup(kb_video())
+            if cached:
+                kind = cached.get("kind", "playlist")
+                markup = kb_video() if kind == "video" else kb_sort()
+                await cq.message.edit_reply_markup(markup)
             else:
-                await cq.message.edit_reply_markup(kb_sort())
+                # Standalone /setquality message → just drop the keyboard
+                try:
+                    await cq.message.edit_reply_markup(None)
+                except Exception:
+                    pass
             return
         state.settings["quality"] = q
         state.mark_dirty()
         await cq.answer(f"Quality: {quality_label(q)}")
-        await cq.message.edit_reply_markup(kb_quality(q))
+        try:
+            await cq.message.edit_reply_markup(kb_quality(q))
+        except Exception:
+            pass
 
     # --- Actions ---
     elif data.startswith("action_"):
@@ -822,11 +998,13 @@ async def on_callback(client: Client, cq: CallbackQuery):
             icon    = "📹" if kind == "video" else ("📋" if kind == "playlist" else "📺")
 
             try:
-                await cq.message.edit_reply_markup(kb_processing())
+                await cq.message.edit_reply_markup(
+                    kb_processing(paused=state.settings.get("paused", False))
+                )
             except Exception:
                 pass
             await cq.answer(
-                f"{icon} {added} added to queue",
+                f"{icon} {added} added · {q_label}",
                 show_alert=(added == 0),
             )
 
@@ -834,25 +1012,43 @@ async def on_callback(client: Client, cq: CallbackQuery):
             state.settings["paused"] = True
             state.mark_dirty()
             await cq.answer("⏸ Paused")
+            await _refresh_dashboard_msg(cq)
 
         elif action == "resume":
             state.settings["paused"] = False
             state.mark_dirty()
             await cq.answer("▶️ Resumed")
+            await _refresh_dashboard_msg(cq)
+
+        elif action == "refresh":
+            await cq.answer("↻")
+            await _refresh_dashboard_msg(cq)
+
+        elif action == "refresh_tasks":
+            active_t, other_t = _ordered_tasks()
+            ordered = active_t + other_t
+            if ordered:
+                try:
+                    await cq.message.edit_reply_markup(kb_tasks_page(ordered, page=0))
+                except Exception:
+                    pass
+                await cq.answer("↻ Refreshed")
+            else:
+                await cq.answer("Queue is empty", show_alert=True)
 
         elif action == "cancel":
             # Discard cached items (used when user taps Discard on scan result)
             _scanned_items_cache.pop(chat_id, None)
             removed = 0
             for t in list(state.all_tasks()):
-                if t.status in (PENDING, "downloading", "downloaded", "uploading"):
+                if t.status in ACTIVE_STATUSES:
                     trigger_cancel(t.id)
                     state.cancel_and_remove(t.id)
                     removed += 1
             if removed:
                 await cq.answer(f"🚫 {removed} tasks removed", show_alert=True)
             else:
-                await cq.answer("✕ Discarded")
+                await cq.answer("✖️ Discarded")
 
         elif action == "status":
             c = state.counts()
@@ -862,32 +1058,35 @@ async def on_callback(client: Client, cq: CallbackQuery):
             )
 
         elif action == "tasks":
-            tasks    = state.all_tasks()
-            active_t = [t for t in tasks if t.status in ("pending", "downloading", "downloaded", "uploading")]
-            other_t  = [t for t in tasks if t.status not in ("pending", "downloading", "downloaded", "uploading")]
-            ordered  = active_t + other_t
+            active_t, other_t = _ordered_tasks()
+            ordered = active_t + other_t
             if not ordered:
                 await cq.answer("Queue is empty", show_alert=True)
                 return
             text = (
                 f"❖ **𝗧𝗮𝘀𝗸 𝗟𝗶𝘀𝘁**\n"
                 f"{SEP}\n"
-                f"⋄ Active: `{len(active_t)}`  |  Total: `{len(ordered)}`\n"
-                f"_Tap ❌ to cancel_"
+                f"⋄ Active: `{len(active_t)}`  ·  Total: `{len(ordered)}`\n"
+                f"_Tap ℹ️ for details · ❌ to cancel_"
             )
             await cq.message.reply(text, reply_markup=kb_tasks_page(ordered, page=0))
             await cq.answer()
 
-        elif action == "queue":
-            tasks = state.all_tasks()
-            text  = "\n".join(f"`{t.id[:8]}` {short(t.title, 28)} [{t.status}]" for t in tasks[:20])
-            await cq.answer(text[:200] or "Empty queue", show_alert=True)
+        elif action == "stats":
+            await cq.message.reply(_stats_text())
+            await cq.answer()
+
+        elif action == "speedtest":
+            await cq.answer("🌐 Starting…")
+            wait_msg = await cq.message.reply("🌐 _Running speed test (25 MB download)…_")
+            result   = await run_speedtest()
+            await wait_msg.edit(result)
 
         elif action == "diskspace":
-            await cq.answer(sys_disk_report()[:200], show_alert=True)
+            await cq.answer(sys_disk_report().replace("`", "")[:200], show_alert=True)
 
         elif action == "serverinfo":
-            await cq.answer(sys_server_report()[:200], show_alert=True)
+            await cq.answer(sys_server_report().replace("`", "")[:200], show_alert=True)
 
         elif action == "channels":
             history = state.settings.get("dest_history", [])
@@ -927,7 +1126,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
             await cq.message.edit_reply_markup(kb_channels(state.settings.get("dest_history", []), target_id))
         except Exception:
             pass
-        await cq.answer(f"Switched to {entry.get('title', target_id)}")
+        await cq.answer(f"✅ Switched to {entry.get('title', target_id)}")
 
     # --- Per-task cancel ---
     elif data.startswith("cancel_task_"):
@@ -941,10 +1140,8 @@ async def on_callback(client: Client, cq: CallbackQuery):
         else:
             await cq.answer("Task not found", show_alert=True)
 
-        tasks    = state.all_tasks()
-        active_t = [t for t in tasks if t.status in ("pending", "downloading", "downloaded", "uploading")]
-        other_t  = [t for t in tasks if t.status not in ("pending", "downloading", "downloaded", "uploading")]
-        ordered  = active_t + other_t
+        active_t, other_t = _ordered_tasks()
+        ordered = active_t + other_t
         if ordered:
             try:
                 await cq.message.edit_reply_markup(kb_tasks_page(ordered, page=0))
@@ -962,9 +1159,10 @@ async def on_callback(client: Client, cq: CallbackQuery):
         task = state.get(vid)
         if task:
             dur = f" · {task.duration}" if task.duration and task.duration != "?" else ""
-            err = f"\n⚠️ `{task.error[:100]}`" if task.error else ""
+            q   = quality_label(getattr(task, "quality", "best"))
+            err = f"\n⚠️ {task.error[:100]}" if task.error else ""
             await cq.answer(
-                f"{short(task.title, 40)}{dur}\nStatus: {task.status}{err}",
+                f"{short(task.title, 40)}{dur}\n{task.status} · {q}{err}",
                 show_alert=True,
             )
         else:
@@ -973,9 +1171,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
     # --- Tasks pagination ---
     elif data.startswith("tasks_page_"):
         page     = int(data.replace("tasks_page_", ""))
-        tasks    = state.all_tasks()
-        active_t = [t for t in tasks if t.status in ("pending", "downloading", "downloaded", "uploading")]
-        other_t  = [t for t in tasks if t.status not in ("pending", "downloading", "downloaded", "uploading")]
+        active_t, other_t = _ordered_tasks()
         ordered  = active_t + other_t
         try:
             await cq.message.edit_reply_markup(kb_tasks_page(ordered, page=page))
@@ -1043,7 +1239,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
         elif action == "resetqueue":
             removed = 0
             for t in list(state.all_tasks()):
-                if t.status in (PENDING, "downloading", "downloaded", "uploading"):
+                if t.status in ACTIVE_STATUSES:
                     trigger_cancel(t.id)
                     state.cancel_and_remove(t.id)
                     removed += 1

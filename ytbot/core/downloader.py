@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -80,6 +81,36 @@ def clear_cancel(task_id: str) -> None:
 # Track bot-detection state so we don't spam the owner
 _bot_detection_alerted: bool = False
 _alert_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Backoff registry — defers tasks that failed for transient reasons
+# (disk full / rate limit) so workers don't hot-loop on them.
+# ---------------------------------------------------------------------------
+_defer_until: Dict[str, float] = {}
+_defer_lock = threading.Lock()
+
+DISK_FULL_BACKOFF_SECS = 300   # re-check disk after 5 min
+RATE_LIMIT_BACKOFF_SECS = 600  # cool down 10 min on hourly cap
+
+
+def _defer_task(task_id: str, seconds: float) -> None:
+    with _defer_lock:
+        _defer_until[task_id] = time.time() + seconds
+
+
+def _clear_defer(task_id: str) -> None:
+    with _defer_lock:
+        _defer_until.pop(task_id, None)
+
+
+def _deferred_ids() -> set:
+    """IDs still inside their backoff window (prunes expired entries)."""
+    now = time.time()
+    with _defer_lock:
+        expired = [k for k, v in _defer_until.items() if v <= now]
+        for k in expired:
+            _defer_until.pop(k, None)
+        return set(_defer_until.keys())
 
 
 def _update_progress(task_id: str, data: Dict[str, Any]) -> None:
@@ -264,17 +295,24 @@ async def download_task(task: Task, state: StateManager) -> bool:
     # --- Pre-download size estimation ---
     estimated = await _estimate_size(task)
     if estimated > 0 and not has_space_for(estimated):
-        logger.warning("Not enough disk for %s (need ~%s)", task.title, human_bytes(estimated))
+        logger.warning("Not enough disk for %s (need ~%s) — retrying in %ds",
+                       task.title, human_bytes(estimated), DISK_FULL_BACKOFF_SECS)
+        _defer_task(task_id, DISK_FULL_BACKOFF_SECS)
         state.update_status(task_id, PENDING)
         _remove_progress(task_id)
         return False
 
     # --- Throttle (respect SLEEP_INTERVAL + hourly cap) ---
     if not apply_request_throttle():
-        logger.warning("Rate limit exceeded, deferring %s", task.title)
+        logger.warning("Rate limit exceeded, deferring %s for %ds",
+                       task.title, RATE_LIMIT_BACKOFF_SECS)
+        _defer_task(task_id, RATE_LIMIT_BACKOFF_SECS)
         state.update_status(task_id, PENDING)
         _remove_progress(task_id)
         return False
+
+    # Cleared all pre-checks — drop any stale backoff entry
+    _clear_defer(task_id)
 
     # --- Register cancel event ---
     cancel_evt = register_cancel(task_id)
@@ -492,23 +530,25 @@ async def download_worker(
             await asyncio.sleep(2)
             continue
 
-        task = state.next_pending()
+        # Atomic claim — no two workers can ever grab the same task, and
+        # tasks inside a backoff window (disk full / rate limit) are skipped.
+        task = state.claim_next_pending(skip_ids=_deferred_ids())
         if task is None:
             await asyncio.sleep(2)
             continue
 
         async with semaphore:
             if stop_event.is_set():
+                state.update_status(task.id, PENDING)
                 break
 
-            state.update_status(task.id, DOWNLOADING)
             success = await download_task(task, state)
 
             if not success:
                 t = state.get(task.id)
                 if t and t.status == DOWNLOADING:
-                    t.attempts += 1
-                    if t.attempts >= Config.MAX_RETRIES:
+                    attempts = state.bump_attempts(task.id)
+                    if attempts >= Config.MAX_RETRIES:
                         state.mark_failed(t, f"Failed after {Config.MAX_RETRIES} attempts")
                     else:
                         state.update_status(task.id, PENDING)

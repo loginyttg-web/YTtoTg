@@ -282,6 +282,26 @@ class StateManager:
             )
             return pending[0] if pending else None
 
+    def claim_next_pending(self, skip_ids: Optional[set] = None) -> Optional[Task]:
+        """Atomically claim the next pending task (marks it DOWNLOADING).
+
+        This prevents two workers from grabbing the same task — the claim and
+        the status flip happen under one lock. `skip_ids` lets workers defer
+        tasks that are in a backoff window (disk full / rate limit).
+        """
+        with self._lock:
+            pending = [
+                t for t in self.tasks.values()
+                if t.status == PENDING and (not skip_ids or t.id not in skip_ids)
+            ]
+            if not pending:
+                return None
+            task = min(pending, key=lambda t: t.order)
+            task.status = DOWNLOADING
+            task.started_at = time.time()
+            self._dirty = True
+            return task
+
     def next_ready_to_upload(self) -> Optional[Task]:
         """Get the next downloaded task ordered by `order`."""
         with self._lock:
@@ -290,6 +310,27 @@ class StateManager:
                 key=lambda t: t.order,
             )
             return ready[0] if ready else None
+
+    def claim_next_upload(self) -> Optional[Task]:
+        """Atomically claim the next downloaded task (marks it UPLOADING)."""
+        with self._lock:
+            ready = [t for t in self.tasks.values() if t.status == DOWNLOADED]
+            if not ready:
+                return None
+            task = min(ready, key=lambda t: t.order)
+            task.status = UPLOADING
+            self._dirty = True
+            return task
+
+    def bump_attempts(self, video_id: str) -> int:
+        """Increment and return a task's attempt counter (thread-safe)."""
+        with self._lock:
+            t = self.tasks.get(video_id)
+            if not t:
+                return 0
+            t.attempts += 1
+            self._dirty = True
+            return t.attempts
 
     # ------------------------------------------------------------------
     # Filter / query
@@ -423,6 +464,42 @@ class StateManager:
             self.tasks.clear()
             self._dirty = True
             return count
+
+    def retry_failed(self) -> int:
+        """Re-queue all FAILED tasks at the end of the queue. Returns count."""
+        with self._lock:
+            n = 0
+            for t in self.tasks.values():
+                if t.status == FAILED:
+                    t.status = PENDING
+                    t.error = ""
+                    t.attempts = 0
+                    t.filepath = ""
+                    t.thumb_path = ""
+                    t.order = self._order_counter
+                    self._order_counter += 1
+                    n += 1
+            if n:
+                self._dirty = True
+            return n
+
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
+    def reset_daily_stats(self) -> None:
+        """Reset the rolling daily counters (called after the daily report)."""
+        with self._lock:
+            self.stats.update({
+                "completed": 0,
+                "failed": 0,
+                "skipped": 0,
+                "bytes_uploaded": 0,
+                "total_time": 0.0,
+                "failed_list": [],
+                "date": time.strftime("%Y-%m-%d"),
+            })
+            self._dirty = True
+        logger.info("Daily stats reset")
 
     # ------------------------------------------------------------------
     # Destination message ID tracking (for /purge)

