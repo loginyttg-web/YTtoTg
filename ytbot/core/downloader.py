@@ -564,6 +564,15 @@ async def download_worker(
             await asyncio.sleep(2)
             continue
 
+        # ── Backpressure ──────────────────────────────────────────────────
+        # Only download when the upload pipeline has room. With a cap of 3,
+        # at most 3 videos sit downloaded-waiting; the next download starts
+        # only after an upload frees a slot. Protects small disks (Railway).
+        qlim = int(state.settings.get("upload_queue_limit", Config.UPLOAD_QUEUE_LIMIT))
+        if state.upload_queue_size() >= qlim:
+            await asyncio.sleep(3)
+            continue
+
         # Atomic claim — no two workers can ever grab the same task, and
         # tasks inside a backoff window (disk full / rate limit) are skipped.
         task = state.claim_next_pending(skip_ids=_deferred_ids())

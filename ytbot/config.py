@@ -72,6 +72,12 @@ class Config:
     PROGRESS_INTERVAL: int = int(os.getenv("PROGRESS_INTERVAL", "3"))
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
 
+    # --- Upload pipeline ---
+    # Upload workers (1 = strictly sequential, 2 = two files in parallel)
+    UPLOAD_WORKERS: int = int(os.getenv("UPLOAD_WORKERS", "1"))
+    # Max downloaded-but-unuploaded videos allowed (backpressure on downloads)
+    UPLOAD_QUEUE_LIMIT: int = int(os.getenv("UPLOAD_QUEUE_LIMIT", "3"))
+
     # --- Paths ---
     DOWNLOAD_DIR: Path = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
     DATA_DIR: Path = Path(os.getenv("DATA_DIR", "./data"))
@@ -155,6 +161,10 @@ class Config:
             errors.append("PARALLEL_DOWNLOADS must be >= 1")
         if cls.PARALLEL_DOWNLOADS > 5:
             errors.append("PARALLEL_DOWNLOADS must be <= 5")
+        if cls.UPLOAD_WORKERS < 1 or cls.UPLOAD_WORKERS > 2:
+            errors.append("UPLOAD_WORKERS must be 1 or 2 (Telegram flood safety)")
+        if cls.UPLOAD_QUEUE_LIMIT < 1 or cls.UPLOAD_QUEUE_LIMIT > 20:
+            errors.append("UPLOAD_QUEUE_LIMIT must be 1–20")
         if cls.DEFAULT_QUALITY not in QUALITY_MAP:
             errors.append(f"DEFAULT_QUALITY must be one of {list(QUALITY_MAP)}")
         if cls.PROGRESS_INTERVAL < 3:

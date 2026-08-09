@@ -42,6 +42,26 @@ def _del_upload_progress(task_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Global FloodWait gate — when Telegram says "slow down", ALL upload
+# workers (and retries) respect the same cooldown window.
+# ---------------------------------------------------------------------------
+_flood_lock = threading.Lock()
+_flood_until: float = 0.0
+
+
+def _set_global_flood(seconds: float) -> None:
+    global _flood_until
+    with _flood_lock:
+        _flood_until = max(_flood_until, time.time() + seconds)
+    logger.warning("🌊 FloodWait — global upload cooldown %ds", seconds)
+
+
+def _global_flood_remaining() -> float:
+    with _flood_lock:
+        return max(0.0, _flood_until - time.time())
+
+
+# ---------------------------------------------------------------------------
 # Caption system — settings, signature footer, builder
 # ---------------------------------------------------------------------------
 
@@ -239,11 +259,15 @@ async def _upload_single(app: Client, task: Task, caption: str, dest: int) -> bo
         raise Exception("Upload timed out after 1 hour")
     except FloodWait as fw:
         logger.warning("FloodWait: sleeping %ds", fw.value)
+        _set_global_flood(fw.value + 1)
         await asyncio.sleep(fw.value + 1)
         try:
             await asyncio.wait_for(_do_send(), timeout=3600)
             _del_upload_progress(task.id)
             return sent_ids or True
+        except FloodWait as fw2:
+            _set_global_flood(fw2.value + 1)
+            raise
         except Exception as exc:
             raise exc
     except Exception:
@@ -300,6 +324,7 @@ async def _upload_split(app: Client, task: Task, caption: str, dest: int):
                     sent_ids.append(msg.id)
             except FloodWait as fw:
                 logger.warning("FloodWait: sleeping %ds", fw.value)
+                _set_global_flood(fw.value + 1)
                 await asyncio.sleep(fw.value + 1)
                 msg = await app.send_document(
                     chat_id=dest,
@@ -357,7 +382,7 @@ async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
             candidate_t = Config.DOWNLOAD_DIR / tp.name
             task.thumb_path = str(candidate_t) if candidate_t.exists() else ""
 
-    video_num = state.next_channel_number(task)
+    video_num = state.reserve_channel_number(task)
     cap_cfg   = get_caption_settings(state)
     caption   = _build_caption(task, video_num, cap_cfg) or None
     dest      = resolve_dest(task)
@@ -383,6 +408,18 @@ async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
             if photo_msg and photo_msg.id:
                 sent_msg_ids.append(photo_msg.id)
             logger.info("Thumbnail photo sent for %s", task.id)
+        except FloodWait as fw:
+            logger.warning("FloodWait on thumb photo: sleeping %ds", fw.value)
+            _set_global_flood(fw.value + 1)
+            await asyncio.sleep(fw.value + 1)
+            try:
+                photo_msg = await app.send_photo(
+                    chat_id=dest, photo=thumb, caption=photo_cap,
+                )
+                if photo_msg and photo_msg.id:
+                    sent_msg_ids.append(photo_msg.id)
+            except Exception as exc:
+                logger.warning("Thumb photo retry failed: %s", exc)
         except Exception as exc:
             logger.warning("Thumbnail photo send failed (continuing): %s", exc)
 
@@ -431,6 +468,12 @@ async def upload_worker(
     while not stop_event.is_set():
         if state.settings.get("paused", False):
             await asyncio.sleep(2)
+            continue
+
+        # FloodWait safety — if any upload hit a flood cooldown, everyone waits
+        rem = _global_flood_remaining()
+        if rem > 0:
+            await asyncio.sleep(min(rem, 30))
             continue
 
         # Atomic claim — status flips to UPLOADING under the state lock.

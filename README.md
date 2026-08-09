@@ -31,7 +31,9 @@ A powerful, owner-only Telegram bot that backs up **YouTube videos, playlists an
 | 🖼 **Exact thumbnails** | The real YouTube thumbnail in highest resolution — never a random video frame |
 | 📤 **Smart uploads** | Thumbnail + video messages, clean `5 May 2026` publish dates, correct dimensions/streaming flag, auto ZIP-splitting for files > 2 GB |
 | 💬 **Caption system** | Toggle captions on/off, add an **Uploaded-by signature** (your name / @username / ID) to every upload |
-| 🔁 **Resilience** | Crash recovery, retries with backoff, disk-full & rate-limit deferral, FloodWait handling |
+| 🔁 **Resilience** | Crash recovery, retries with backoff, disk-full & rate-limit deferral, shared FloodWait cooldown |
+| 🔄 **Crash resume** | `/syncfrom <last_uploaded_link>` re-queues everything after (or before) any video |
+| ⚙️ **Worker tuning** | Separate download (1–5) & upload (1–2) workers + upload-queue cap with download backpressure |
 | 🛡 **Anti-bot layer** | cookies.txt auth, PO-Token support, request throttling with jitter, bot-detection alerts with guided fixes |
 | 📈 **Reports** | Daily summary (auto-reset counters), `/stats` session report, disk/CPU/RAM monitoring |
 | 🧹 **Housekeeping** | Auto temp cleanup, `/purge` tracked-message deletion, `/clear`, `/retryfailed` |
@@ -134,6 +136,70 @@ Required credentials:
 > 🍪 **Recommended:** upload YouTube cookies with the `/cookies` command to avoid
 > YouTube's "Sign in to confirm you're not a robot" wall.
 
+## 🚂 Deploy on Railway (recommended)
+
+1. **Push this repo to GitHub** (already done) → [railway.app](https://railway.app) →
+   **New Project → Deploy from GitHub repo**.
+2. **Add a Volume** — right-click the service → *Add Volume* → mount path **`/data`**.
+   _(Without a volume, state/cookies vanish on every redeploy!)_
+3. **Set these Variables** (service → Variables tab):
+
+   | Variable | Value — where to get it |
+   |---|---|
+   | `API_ID` `API_HASH` | [my.telegram.org](https://my.telegram.org) → API development tools |
+   | `BOT_TOKEN` | [@BotFather](https://t.me/BotFather) → `/newbot` or `/token` |
+   | `OWNER_ID` | your numeric ID — message [@userinfobot](https://t.me/userinfobot) |
+   | `DEST_CHAT_ID` | your channel/group ID — forward one of its messages to [@getidsbot](https://t.me/getidsbot) (channels look like `-100…`) |
+   | `DATA_DIR` | `/data/ytdata` |
+   | `DOWNLOAD_DIR` | `/data/downloads` |
+   | `PROGRESS_INTERVAL` | `5` _(live UI updates every 5 s)_ |
+   | `PARALLEL_DOWNLOADS` | `3` _(download workers, 1–5)_ |
+   | `UPLOAD_WORKERS` | `1` _(or `2` for parallel uploads)_ |
+   | `UPLOAD_QUEUE_LIMIT` | `3` _(download backpressure cap)_ |
+   | `WATCH_INTERVAL_MIN` | `30` _(auto-watch default)_ |
+   | `DEFAULT_QUALITY` | `best` |
+
+4. **Deploy.** After the startup ping arrives, send `/cookies` in the bot chat and
+   reply with your `cookies.txt` — it's saved on the volume and survives redeploys.
+5. `/watch <channel> <DEST_CHAT_ID>` and you're fully automatic.
+
+The repo ships `railway.json` + `nixpacks.toml` (Python 3.11 + Node.js for
+yt-dlp + ffmpeg) — no extra build setup needed. Railway runs the bot as a
+worker with `restartPolicyType: ALWAYS`, so crashes auto-restart; the queue
+persists in `state.json` on the volume.
+
+> 💸 Note: a 24/7 bot consumes ~720 h/month of Railway usage — the free trial
+> won't cover it, the Hobby plan does.
+
+## 🔄 Crash Recovery — resume from the last uploaded video
+
+If the server dies and the state is lost (or you just want to continue an
+existing destination channel):
+
+```
+/syncfrom https://youtube.com/watch?v=XXXXXXXXXXX        ← everything NEWER
+/syncfrom https://youtube.com/watch?v=XXXXXXXXXXX before ← everything OLDER
+```
+
+Send the link of the **last video already uploaded** — the bot finds that
+video's channel, locates it in the channel's upload list, and queues every
+video after it (oldest first) to the right destination. If the channel is
+being watched, its known-snapshot is synced too so nothing is double-queued.
+
+## ⚡ Workers & Backpressure
+
+```
+/setparallel 3    download workers (1-5)
+/setuploaders 1   upload workers (1 = sequential, 2 = parallel)
+/setqlimit 3      upload queue cap
+```
+
+With `setqlimit 3`: at most **3 videos** may sit downloaded-waiting/uploading.
+The download workers pause automatically and resume only when an upload frees
+a slot — this keeps small disks (like Railway volumes) from overflowing.
+Uploads always stream through one FloodWait-safe pipeline: any Telegram
+flood cooldown is shared across all workers.
+
 ---
 
 ## 🤖 Commands
@@ -168,6 +234,7 @@ Required credentials:
 | `/dashboard` | Pin the live progress panel in the current chat |
 | `/tasks` | Paginated task list with ℹ️ info / ❌ cancel buttons |
 | `/cancel <id or url>` | Cancel a single task |
+| `/syncfrom <video_link> [before]` | Crash recovery — queue everything after/before that video |
 | `/pause` · `/resume` | Hold / continue all processing |
 | `/resetqueue` | Cancel all active tasks |
 | `/clear` | Remove finished tasks from the list |
@@ -181,6 +248,8 @@ Required credentials:
 | `/setname <text>` | Your name for the Uploaded-by signature |
 | `/setusername [handle]` | Signature @username (no arg = yours) |
 | `/setparallel <1-5>` | Parallel download workers |
+| `/setuploaders <1-2>` | Upload workers (1 = sequential, 2 = parallel) |
+| `/setqlimit <1-20>` | Upload queue cap → download backpressure |
 | `/setchannel [chat_id]` | Set upload destination |
 | `/channels` | Saved destinations — tap to switch |
 | `/destinfo` | Current destination info (incl. watch routing) |

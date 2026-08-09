@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import re
 import time
 from typing import Optional
@@ -144,13 +145,15 @@ START_TEXT = (
     "**📥 Queue**\n"
     "`/status` · `/tasks` · `/dashboard` · `/stats`\n"
     "`/cancel <id|url>` · `/pause` · `/resume`\n"
-    "`/resetqueue` · `/clear` · `/retryfailed`\n\n"
+    "`/resetqueue` · `/clear` · `/retryfailed`\n"
+    "`/syncfrom <last_video_link>` resume after crash\n\n"
     "**👥 Users** (owner)\n"
     "`/adduser` · `/removeuser` · `/setrole` · `/users`\n"
     "`/whoami` — check your role\n\n"
     "**⚙️ Settings**\n"
     "`/setquality <best|2160|1440|1080|720|480|audio>`\n"
-    "`/setparallel <1-5>` · `/watchinterval <min>`\n"
+    "`/setparallel <1-5>` downloads · `/setuploaders <1-2>` uploads\n"
+    "`/setqlimit <n>` upload queue cap · `/watchinterval <min>`\n"
     "`/setchannel [id]` · `/channels` · `/destinfo`\n"
     "`/caption` upload captions + Uploaded-by signature\n\n"
     "**🖥 System**\n"
@@ -223,13 +226,17 @@ async def cmd_status(client: Client, message: Message):
     watch_line = f"👀 `{w_on}/{len(watches)}` watches active\n" if watches else ""
     iv = int(state.settings.get("watch_interval_min", 0) or Config.WATCH_INTERVAL_MIN)
 
+    qlim  = int(state.settings.get("upload_queue_limit", Config.UPLOAD_QUEUE_LIMIT))
+    ready = state.upload_queue_size()
+
     text = (
         f"❖ **𝗤𝘂𝗲𝘂𝗲 𝗦𝘁𝗮𝘁𝘂𝘀**\n"
         f"{SEP}\n"
-        f"{dot} {stat}   ⚡ `{pq}` workers   🎞 {quality_label(q)}\n\n"
+        f"{dot} {stat}   ⚡ ⬇`{pq}` ⬆`{Config.UPLOAD_WORKERS}` workers\n\n"
         f"{summary}\n\n"
         f"✅ `{c['completed']}`   ❌ `{c['failed']}`   ⏳ `{c['pending']}`\n"
         f"⬇️ `{c['downloading']}`   📤 `{c['uploading']}`   🚫 `{c['cancelled']}`\n\n"
+        f"📦 Upload queue: `{ready}/{qlim}` (download backpressure)\n"
         f"{watch_line}🕐 _Watcher auto-checks every {iv}m_\n"
         f"{SEP}"
     )
@@ -611,6 +618,184 @@ async def cmd_backfill(client: Client, message: Message):
         f"⋄ Channel: **{md_escape(w.title or w.id)}**\n"
         f"⋄ Videos: `{n}`\n"
         f"⋄ Destination: `{dest}`"
+    )
+
+
+# ---------------------------------------------------------------------------
+# /syncfrom — resume after crash: "is video ke baad wale sab bhejo"
+# ---------------------------------------------------------------------------
+
+@Client.on_message(filters.command(["syncfrom", "resumefrom"]) & admin_filter)
+async def cmd_syncfrom(client: Client, message: Message):
+    """
+    Send the LAST successfully uploaded video link:
+      /syncfrom <video_link>          → queue everything NEWER than it
+      /syncfrom <video_link> before   → queue everything OLDER than it
+    Perfect for recovering after a server crash / fresh deploy.
+    """
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply(
+            "❖ **𝗥𝗲𝘀𝘂𝗺𝗲 𝗔𝗳𝘁𝗲𝗿 𝗖𝗿𝗮𝘀𝗵**\n"
+            f"{SEP}\n"
+            "Send the link of the **last video that was already uploaded**:\n\n"
+            "`/syncfrom <video_link>`\n"
+            "→ queues all videos uploaded **after** it\n\n"
+            "`/syncfrom <video_link> before`\n"
+            "→ queues all **older** videos instead\n\n"
+            "_The marker video itself is NOT re-uploaded._"
+        )
+        return
+
+    url = next((a for a in args[1:] if a.lower().startswith("http") or "youtu" in a.lower()), None)
+    direction = "before" if any(a.lower() in ("before", "older", "pehle") for a in args[1:]) else "after"
+
+    if not url:
+        await message.reply("❌ Video link missing. Usage: `/syncfrom <video_link>`")
+        return
+
+    marker_vid = parse_video_id(url)
+    if not marker_vid:
+        await message.reply("❌ Could not extract a video ID from that link.")
+        return
+
+    wait_msg = await message.reply("⏳ _Step 1/2 — finding the video's channel…_")
+
+    try:
+        vres = await scan(url)
+    except Exception as exc:
+        await wait_msg.edit(f"❌ Could not read the video: `{exc}`")
+        return
+
+    vmeta = vres.get("meta", {}) or {}
+    ch_url = vmeta.get("channel_url", "")
+    marker_title = (vres.get("items") or [{}])[0].get("title", marker_vid)
+    if not ch_url:
+        await wait_msg.edit("❌ Could not resolve the channel of that video.")
+        return
+
+    try:
+        await wait_msg.edit("⏳ _Step 2/2 — scanning full channel list…_")
+        cres = await scan(ch_url)
+    except Exception as exc:
+        await wait_msg.edit(f"❌ Channel scan failed: `{exc}`")
+        return
+
+    items = cres.get("items", [])
+    ordered = sort_items(items, "old_new")   # oldest → newest
+
+    idx = next((i for i, it in enumerate(ordered) if it.get("id") == marker_vid), None)
+    if idx is None:
+        await wait_msg.edit(
+            f"❌ Marker video not found in the channel's upload list.\n"
+            f"_It may be deleted, a Short, or from another tab._"
+        )
+        return
+
+    selected = ordered[:idx] if direction == "before" else ordered[idx + 1:]
+    if not selected:
+        await wait_msg.edit(
+            f"✅ Marker found: **{md_escape(short(marker_title, 40))}**\n"
+            f"…but there are no videos **{direction}** it. Nothing to queue."
+        )
+        return
+
+    # ── Route via matching watch (destination + known-snapshot) ─────────
+    watch = state.watch_by_key(ch_url, cres.get("meta", {}).get("source_url", ""))
+    dest = watch.dest_chat_id if watch else 0
+    if watch:
+        covered = ordered[:idx + 1] + (selected if direction == "after" else [])
+        known = set(watch.known_ids) | {it["id"] for it in covered if it.get("id")}
+        watch.known_ids = list(known)[-5000:]
+        state.mark_dirty()
+
+    quality = (watch.quality if watch else "") or state.settings.get("quality", "best")
+    uid = message.from_user.id if message.from_user else 0
+    n, _ = state.add_tasks(
+        sort_items(selected, "old_new"), source="sync", quality=quality,
+        dest_chat_id=dest, added_by=uid,
+    )
+    state.save()
+
+    ch_name = cres.get("channel", "") or ch_url
+    dest_txt = (
+        f"**{watch.dest_chat_title or watch.dest_chat_id}** (watch `{watch.id}`)"
+        if watch else "**Global destination** (`/destinfo`)"
+    )
+    arrow = "⬆️ newer" if direction == "after" else "⬇️ older"
+
+    await wait_msg.edit(
+        f"✅ **𝗦𝘆𝗻𝗰 𝗖𝗼𝗺𝗽𝗹𝗲𝘁𝗲!**\n"
+        f"{SEP}\n"
+        f"⋄ 📺 Channel: **{md_escape(ch_name)}**\n"
+        f"⋄ 📌 Marker: **{md_escape(short(marker_title, 36))}**\n"
+        f"⋄ {arrow} videos queued: `{n}`\n"
+        f"⋄ 🎞 Quality: {quality_label(quality)}\n"
+        f"⋄ 📍 Destination: {dest_txt}\n"
+        f"{SEP}\n"
+        f"_Marker video skipped (already uploaded). /status to watch progress._"
+        + ("" if watch else "\n\n💡 `/watch " + ch_url + "` to keep it auto-synced.")
+    )
+
+
+# ---------------------------------------------------------------------------
+# /setuploaders  &  /setqlimit — upload pipeline tuning (owner)
+# ---------------------------------------------------------------------------
+
+@Client.on_message(filters.command("setuploaders") & owner_filter)
+async def cmd_setuploaders(client: Client, message: Message):
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply(
+            f"Upload workers: `{Config.UPLOAD_WORKERS}`\n\n"
+            "Usage: `/setuploaders 1` or `/setuploaders 2`\n"
+            "_1 = strictly sequential (safest) · 2 = parallel (faster, mild flood risk)_\n\n"
+            "⚠️ Takes effect after bot restart."
+        )
+        return
+    try:
+        n = int(args[1])
+    except ValueError:
+        await message.reply("❌ Provide 1 or 2.")
+        return
+    if n not in (1, 2):
+        await message.reply("❌ Only 1 or 2 upload workers allowed (Telegram flood safety).")
+        return
+    Config.UPLOAD_WORKERS = n
+    os.environ["UPLOAD_WORKERS"] = str(n)
+    await message.reply(
+        f"⬆️ Upload workers → `{n}`\n"
+        f"_Fully applied after restart. Uploads within each worker stay sequential "
+        f"and share one FloodWait cooldown._"
+    )
+
+
+@Client.on_message(filters.command("setqlimit") & owner_filter)
+async def cmd_setqlimit(client: Client, message: Message):
+    """Upload-queue watermark: max videos waiting downloaded for upload."""
+    args = message.text.split()
+    cur = int(state.settings.get("upload_queue_limit", Config.UPLOAD_QUEUE_LIMIT))
+    if len(args) < 2:
+        await message.reply(
+            f"Upload queue cap: `{cur}` videos\n\n"
+            "Usage: `/setqlimit 3`\n"
+            "_Downloads pause automatically whenever this many videos are "
+            "already downloaded-waiting/uploading — protects disk space._"
+        )
+        return
+    try:
+        n = int(args[1])
+    except ValueError:
+        await message.reply("❌ Provide a number 1–20.")
+        return
+    if n < 1 or n > 20:
+        await message.reply("❌ Cap must be 1–20.")
+        return
+    state.settings["upload_queue_limit"] = n
+    state.mark_dirty()
+    await message.reply(
+        f"📦 Upload queue cap → `{n}` videos\n"
+        f"_New downloads start only when the upload pipeline drops below {n}._"
     )
 
 

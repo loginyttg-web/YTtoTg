@@ -301,7 +301,10 @@ async def main() -> None:
     await set_bot_commands(app)
 
 
-    logger.info("🤖 Bot started! Owner: %d  Dest: %d", Config.OWNER_ID, Config.DEST_CHAT_ID)
+    logger.info("🤖 Bot started! Owner: %d  Dest: %d  ⬇%d dl · ⬆%d ul workers · queue cap %d",
+                Config.OWNER_ID, Config.DEST_CHAT_ID,
+                Config.PARALLEL_DOWNLOADS, Config.UPLOAD_WORKERS,
+                Config.UPLOAD_QUEUE_LIMIT)
 
     # Startup ping — send to owner & dest channel, auto-delete after 10s
     await _send_startup_ping(app)
@@ -319,10 +322,11 @@ async def main() -> None:
             asyncio.create_task(download_worker(w_id + 1, semaphore, stop_event, state))
         )
 
-    # Upload worker (single, sequential)
-    background_tasks.append(
-        asyncio.create_task(upload_worker(app, stop_event, state))
-    )
+    # Upload workers (1 = strictly sequential, 2 = parallel, FloodWait-shared)
+    for _u in range(Config.UPLOAD_WORKERS):
+        background_tasks.append(
+            asyncio.create_task(upload_worker(app, stop_event, state))
+        )
 
     # Dashboard
     background_tasks.append(

@@ -159,6 +159,7 @@ class StateManager:
             "watch_counter": 0,
             "watcher_paused": False,
             "watch_interval_min": 0,   # 0 → Config.WATCH_INTERVAL_MIN
+            "upload_queue_limit": Config.UPLOAD_QUEUE_LIMIT,
         }
         self.stats: Dict[str, Any] = {
             "completed": 0,
@@ -410,6 +411,12 @@ class StateManager:
             self._dirty = True
             return t.attempts
 
+    def upload_queue_size(self) -> int:
+        """Downloaded-waiting + currently uploading = upload pipeline load."""
+        with self._lock:
+            return sum(1 for t in self.tasks.values()
+                       if t.status in (DOWNLOADED, UPLOADING))
+
     # ------------------------------------------------------------------
     # Filter / query
     # ------------------------------------------------------------------
@@ -456,6 +463,25 @@ class StateManager:
                 and (t.channel or "").strip().casefold() == channel
             ]
             return len(completed) + 1
+
+    def reserve_channel_number(self, task: Task) -> int:
+        """Atomically reserve the next caption number (parallel-upload safe).
+
+        With multiple upload workers two tasks could otherwise grab the same
+        number; this reserves it under the state lock and never reuses one.
+        """
+        channel = (task.channel or "").strip().casefold()
+        with self._lock:
+            nums = self.settings.setdefault("channel_numbers", {})
+            completed = sum(
+                1 for t in self.tasks.values()
+                if t.status == COMPLETED
+                and (t.channel or "").strip().casefold() == channel
+            )
+            reserved = max(int(nums.get(channel, 0)), completed) + 1
+            nums[channel] = reserved
+            self._dirty = True
+            return reserved
 
     # ------------------------------------------------------------------
     # Status transitions
