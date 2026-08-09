@@ -16,6 +16,9 @@ def kb_sort() -> InlineKeyboardMarkup:
             InlineKeyboardButton("▶️ Start",    callback_data="action_start"),
             InlineKeyboardButton("🗑 Discard",  callback_data="action_cancel"),
         ],
+        [
+            InlineKeyboardButton("👀 Auto-Watch this (new uploads)", callback_data="watch_this"),
+        ],
     ])
 
 
@@ -116,18 +119,43 @@ def kb_tasks_page(tasks, page: int = 0, page_size: int = 8) -> InlineKeyboardMar
 def kb_start() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📊 Status",   callback_data="action_status"),
-            InlineKeyboardButton("📋 Tasks",    callback_data="action_tasks"),
+            InlineKeyboardButton("📊 Status",  callback_data="action_status"),
+            InlineKeyboardButton("📋 Tasks",   callback_data="action_tasks"),
+        ],
+        [
+            InlineKeyboardButton("📈 Stats",   callback_data="action_stats"),
+            InlineKeyboardButton("📊 Live Dashboard", callback_data="action_dashboard"),
         ],
         [
             InlineKeyboardButton("💾 Disk",     callback_data="action_diskspace"),
             InlineKeyboardButton("🖥 Server",   callback_data="action_serverinfo"),
-            InlineKeyboardButton("🌐 Speedtest", callback_data="action_speedtest"),
+            InlineKeyboardButton("🌐 Speed",    callback_data="action_speedtest"),
         ],
         [
-            InlineKeyboardButton("📈 Session Stats", callback_data="action_stats"),
+            InlineKeyboardButton("👀 Watches",       callback_data="watchlist_open"),
             InlineKeyboardButton("📍 Destinations",  callback_data="action_channels"),
         ],
+    ])
+
+
+def kb_caption(cfg: dict) -> InlineKeyboardMarkup:
+    """Caption settings panel — live toggle buttons."""
+    def mark(on: bool) -> str:
+        return "✅" if on else "❌"
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"📝 Captions: {mark(cfg.get('enabled', True))}",
+                                 callback_data="cap_main"),
+            InlineKeyboardButton(f"⚡ Signature: {mark(cfg.get('signature', True))}",
+                                 callback_data="cap_sig"),
+        ],
+        [
+            InlineKeyboardButton(f"🆔 Show ID: {mark(cfg.get('show_id', False))}",
+                                 callback_data="cap_id"),
+            InlineKeyboardButton("↻ Refresh", callback_data="cap_refresh"),
+        ],
+        [InlineKeyboardButton("✖️ Close", callback_data="tasks_close")],
     ])
 
 

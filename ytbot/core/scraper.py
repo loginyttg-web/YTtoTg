@@ -224,13 +224,55 @@ def sort_items(items: List[Dict[str, Any]], order: str = "new_old") -> List[Dict
     )
 
 
+def date_range_of(items: List[Dict[str, Any]]) -> str:
+    """'3 Jan 2020 → 5 Aug 2026' from items' upload_date (or '')."""
+    from utils.helpers import fmt_yt_date
+    ds = sorted({
+        str(it.get("upload_date") or "") for it in items
+        if str(it.get("upload_date") or "").isdigit() and len(str(it.get("upload_date") or "")) == 8
+    })
+    if not ds:
+        return ""
+    return f"{fmt_yt_date(ds[0])} → {fmt_yt_date(ds[-1])}"
+
+
+def total_duration_secs(items: List[Dict[str, Any]]) -> int:
+    """Sum of item durations in seconds."""
+    total = 0
+    for item in items:
+        parts = str(item.get("duration", "")).split(":")
+        try:
+            if len(parts) == 3:
+                total += int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            elif len(parts) == 2:
+                total += int(parts[0]) * 60 + int(parts[1])
+        except ValueError:
+            pass
+    return total
+
+
+def _fmt_total(secs: int) -> str:
+    d, r = divmod(secs, 86400)
+    h, r = divmod(r, 3600)
+    m, s = divmod(r, 60)
+    if d:
+        return f"{d}d {h}h {m}m"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m {s}s"
+
+
 def generate_txt(
     items: List[Dict[str, Any]],
     channel: str,
     kind: str,
     meta: Optional[Dict[str, Any]] = None,
+    quality: str = "",
 ) -> Path:
     """Generate a rich .txt listing file. Returns path to saved file."""
+    from utils.helpers import fmt_yt_date
+    from config import quality_label
+
     out_dir = Config.DATA_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -241,63 +283,62 @@ def generate_txt(
     meta = meta or {}
     subs        = meta.get("subscribers", "—")
     ch_url      = meta.get("channel_url", "")
-    verified    = "✔ Verified" if meta.get("verified") else ""
+    verified    = "  ✔ Verified" if meta.get("verified") else ""
     source_url  = meta.get("source_url", "")
     description = (meta.get("description") or "").strip()
+    pl_title    = meta.get("playlist_title", "") or channel
 
-    # Total duration sum
-    total_secs = 0
-    for item in items:
-        d = item.get("duration", "")
-        parts = str(d).split(":")
-        try:
-            if len(parts) == 3:
-                total_secs += int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-            elif len(parts) == 2:
-                total_secs += int(parts[0]) * 60 + int(parts[1])
-        except ValueError:
-            pass
-    def _fmt_total(secs: int) -> str:
-        h, r = divmod(secs, 3600); m, s = divmod(r, 60)
-        return f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+    icon        = "📋" if kind == "playlist" else ("📺" if kind == "channel" else "📹")
+    total_secs  = total_duration_secs(items)
+    date_range  = date_range_of(items)
 
+    W = 54
     lines = [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"  YT BACKUP LIST  —  {kind.upper()}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"  Channel     : {channel} {verified}",
-        f"  Subscribers : {subs}",
+        "═" * W,
+        f"  {icon}  YT BACKUP LIST — {kind.upper()}",
+        "═" * W,
+        "",
+        f"  {icon} Title       : {pl_title}",
+        f"  📺 Channel      : {channel}{verified}",
+        f"  👥 Subscribers  : {subs}",
     ]
     if ch_url:
-        lines.append(f"  Channel URL : {ch_url}")
+        lines.append(f"  🔗 Channel URL  : {ch_url}")
     if source_url:
-        lines.append(f"  Source URL  : {source_url}")
+        lines.append(f"  🔗 Source URL   : {source_url}")
     lines += [
-        f"  Total Videos: {len(items)}",
-        f"  Total Time  : {_fmt_total(total_secs)}",
-        f"  Generated   : {_now()}",
+        f"  🎬 Total Videos : {len(items)}",
+        f"  ⏱  Total Time   : {_fmt_total(total_secs)}",
     ]
+    if date_range:
+        lines.append(f"  📅 Date Range   : {date_range}")
+    if quality:
+        lines.append(f"  🎞 Quality      : {quality_label(quality)}")
+    lines.append(f"  🕐 Generated    : {_now()}")
     if description:
-        lines += ["", f"  About: {description}"]
-    lines += [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "",
-    ]
+        lines += ["", f"  📖 About: {description}"]
+    lines += ["", "─" * W, ""]
 
-    from utils.helpers import fmt_yt_date
     for i, item in enumerate(items, 1):
-        title = item.get("title", "Untitled")
-        dur   = item.get("duration", "?")
-        # YYYYMMDD → '5 May 2026' (clean, no leading zeros)
-        date_fmt = fmt_yt_date(item.get("upload_date", ""))
-        url   = item.get("url", "")
+        title    = item.get("title", "Untitled")
+        dur      = item.get("duration", "?")
+        date_fmt = fmt_yt_date(item.get("upload_date", ""), item.get("upload_time", ""))
+        url      = item.get("url", "")
+
+        lines.append(f"{i:>4}. {title}")
+        meta_bits = [f"⏱ {dur}"]
         if date_fmt and date_fmt != "—":
-            date_part = f" | 📅 {date_fmt}"
-        else:
-            date_part = ""
-        lines.append(f"{i:>4}. {title} | ⏱ {dur}{date_part}")
-        lines.append(f"       🔗 {url}")
+            meta_bits.append(f"📅 {date_fmt}")
+        lines.append(f"      {' · '.join(meta_bits)}")
+        lines.append(f"      🔗 {url}")
         lines.append("")
+
+    lines += [
+        "─" * W,
+        f"  ✔ {len(items)} videos · ⏱ {_fmt_total(total_secs)}"
+        + (f" · 📅 {date_range}" if date_range else ""),
+        "  Generated by YT → Telegram Backup Bot",
+    ]
 
     filepath.write_text("\n".join(lines), encoding="utf-8")
     logger.info("Generated txt: %s (%d entries)", filepath.name, len(items))
@@ -318,7 +359,8 @@ def _fmt_duration(seconds: int) -> str:
 
 def _now() -> str:
     from datetime import datetime
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    d = datetime.now()
+    return f"{d.day} {d.strftime('%b %Y · %I:%M %p')}"
 
 
 def _timestamp_to_date(value: Any) -> str:

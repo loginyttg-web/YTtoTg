@@ -30,6 +30,7 @@ A powerful, owner-only Telegram bot that backs up **YouTube videos, playlists an
 | 🎞 **Quality control** | `best / 4K / 2K / 1080p / 720p / 480p / audio` with automatic fallback (4K → 1080 → 720…), per-session and per-watch |
 | 🖼 **Exact thumbnails** | The real YouTube thumbnail in highest resolution — never a random video frame |
 | 📤 **Smart uploads** | Thumbnail + video messages, clean `5 May 2026` publish dates, correct dimensions/streaming flag, auto ZIP-splitting for files > 2 GB |
+| 💬 **Caption system** | Toggle captions on/off, add an **Uploaded-by signature** (your name / @username / ID) to every upload |
 | 🔁 **Resilience** | Crash recovery, retries with backoff, disk-full & rate-limit deferral, FloodWait handling |
 | 🛡 **Anti-bot layer** | cookies.txt auth, PO-Token support, request throttling with jitter, bot-detection alerts with guided fixes |
 | 📈 **Reports** | Daily summary (auto-reset counters), `/stats` session report, disk/CPU/RAM monitoring |
@@ -69,6 +70,29 @@ Useful extras: `/watch <url> all` also backfills existing videos,
 `/backfill w3` queues everything later,
 `/watchdest w3 -100xxx` moves a channel to a different chat,
 `/watchquality w3 720` saves bandwidth on a specific channel.
+While viewing a scan result, the **👀 Auto-Watch this** button creates the
+watch in one tap.
+
+## 💬 Upload Captions & Signature
+
+```
+**Never Gonna Give You Up**
+━━━━━━━━━━━━━━━━━━━━
+📺 Rick Astley
+🎞 4K  ·  ⏱ `3:32`
+📅 `5 May 2026  18:30`  ·  📤 `9 Aug 2026`
+🔗 https://youtu.be/dQw4w9WgXcQ
+━━━━━━━━━━━━━━━━━━━━
+⚡ #7 · Uploaded by **KAL BABU** @KALBABU01 🆔 `123456789`
+```
+
+- `/caption` opens a button panel: toggle **captions**, **signature** and
+  **show-ID** live — applies to every video & split-part file.
+- `/setname Your Name` + `/setusername handle` set the signature.
+- `/caption off` uploads everything **without** captions.
+- The signature lives in the Telegram caption — separate from the TXT list,
+  whose own header carries full channel metadata (subs, date range, quality,
+  total duration, verified badge…).
 
 ## 👥 Roles & Permissions
 
@@ -152,11 +176,14 @@ Required credentials:
 ### ⚙️ Settings
 | Command | Description |
 |---|---|
-| `/setquality <best\|1080\|720\|480\|audio>` | Default quality for new tasks |
+| `/setquality <best\|2160\|1440\|1080\|720\|480\|audio>` | Default quality (auto-fallback when higher unavailable) |
+| `/caption [on\|off]` | Caption settings panel — toggle captions / signature / ID |
+| `/setname <text>` | Your name for the Uploaded-by signature |
+| `/setusername [handle]` | Signature @username (no arg = yours) |
 | `/setparallel <1-5>` | Parallel download workers |
 | `/setchannel [chat_id]` | Set upload destination |
 | `/channels` | Saved destinations — tap to switch |
-| `/destinfo` | Current destination info |
+| `/destinfo` | Current destination info (incl. watch routing) |
 
 ### 🖥 System
 | Command | Description |

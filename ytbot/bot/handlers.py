@@ -21,7 +21,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery
 
 from config import Config, quality_label
-from core.scraper import scan, sort_items, generate_txt
+from core.scraper import scan, sort_items, generate_txt, date_range_of, total_duration_secs
 from core.state import (
     StateManager, PENDING, ROLE_OWNER, ROLE_ADMIN, ROLE_USER, ROLE_ICON,
 )
@@ -41,7 +41,7 @@ from utils.logger import tail_log
 from bot.keyboards import (
     kb_sort, kb_quality, kb_processing, kb_confirm, kb_start,
     kb_tasks_page, kb_video, kb_channels,
-    kb_watch_actions, kb_watchlist, kb_users,
+    kb_watch_actions, kb_watchlist, kb_users, kb_caption,
 )
 
 logger = logging.getLogger("handlers")
@@ -149,9 +149,10 @@ START_TEXT = (
     "`/adduser` · `/removeuser` · `/setrole` · `/users`\n"
     "`/whoami` — check your role\n\n"
     "**⚙️ Settings**\n"
-    "`/setquality <best|1080|720|480|audio>`\n"
+    "`/setquality <best|2160|1440|1080|720|480|audio>`\n"
     "`/setparallel <1-5>` · `/watchinterval <min>`\n"
-    "`/setchannel [id]` · `/channels` · `/destinfo`\n\n"
+    "`/setchannel [id]` · `/channels` · `/destinfo`\n"
+    "`/caption` upload captions + Uploaded-by signature\n\n"
     "**🖥 System**\n"
     "`/serverinfo` · `/diskspace` · `/speedtest`\n"
     "`/logs [n|level]` · `/purge <n>`\n\n"
@@ -1264,6 +1265,106 @@ async def cmd_setquality(client: Client, message: Message):
 
 
 # ---------------------------------------------------------------------------
+# /caption  &  /setname  &  /setusername — upload caption control
+# ---------------------------------------------------------------------------
+
+def _caption_panel_text() -> str:
+    from core.uploader import get_caption_settings, signature_preview
+    cfg = get_caption_settings(state)
+    on  = lambda b: "✅ ON" if b else "❌ OFF"
+
+    lines = [
+        "❖ **𝗖𝗮𝗽𝘁𝗶𝗼𝗻 𝗦𝗲𝘁𝘁𝗶𝗻𝗴𝘀**",
+        SEP,
+        f"⋄ 📝 Captions: {on(cfg['enabled'])}",
+        f"⋄ ⚡ Uploaded-by signature: {on(cfg['signature'])}",
+        f"⋄ 👤 Name: `{cfg['name'] or '—'}`",
+        f"⋄ 🔗 Username: `{('@' + cfg['username']) if cfg['username'] else '—'}`",
+        f"⋄ 🆔 Show owner ID: {on(cfg['show_id'])}",
+        SEP,
+        "✏️ Set name: `/setname Your Name`",
+        "🔗 Set username: `/setusername handle`",
+        "_(or just `/setusername` to use yours)_",
+    ]
+    preview = signature_preview(cfg, video_num=1)
+    if preview:
+        lines += ["", "**Live preview:**", preview]
+    return "\n".join(lines)
+
+
+@Client.on_message(filters.command("caption") & admin_filter)
+async def cmd_caption(client: Client, message: Message):
+    args = message.text.split()
+    if len(args) > 1 and args[1].lower() in ("on", "off", "enable", "disable"):
+        enabled = args[1].lower() in ("on", "enable")
+        state.settings["caption_enabled"] = enabled
+        state.mark_dirty()
+        from core.uploader import get_caption_settings
+        await message.reply(
+            f"📝 Upload captions → {'✅ ON' if enabled else '❌ OFF'}\n"
+            + ("_Videos will upload with full info captions._" if enabled
+               else "_Videos will upload **without** captions._"),
+            reply_markup=kb_caption(get_caption_settings(state)),
+        )
+        return
+
+    from core.uploader import get_caption_settings
+    await message.reply(
+        _caption_panel_text(),
+        reply_markup=kb_caption(get_caption_settings(state)),
+    )
+
+
+@Client.on_message(filters.command("setname") & admin_filter)
+async def cmd_setname(client: Client, message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        cur = state.settings.get("caption_name", "")
+        await message.reply(
+            f"Usage: `/setname KAL BABU`\n_Current name: `{cur or '—'}`_"
+        )
+        return
+    name = args[1].strip()[:40]
+    state.settings["caption_name"] = name
+    state.mark_dirty()
+
+    from core.uploader import get_caption_settings, signature_preview
+    await message.reply(
+        f"✅ Signature name set → **{md_escape(name)}**\n\n"
+        f"**Preview:**\n{signature_preview(get_caption_settings(state))}"
+    )
+
+
+@Client.on_message(filters.command("setusername") & admin_filter)
+async def cmd_setusername(client: Client, message: Message):
+    args = message.text.split()
+    uname = args[1].strip().lstrip("@") if len(args) > 1 else ""
+
+    if not uname:
+        # Auto-pick the sender's own username
+        uname = (message.from_user.username or "") if message.from_user else ""
+        if not uname:
+            await message.reply(
+                "❌ You have no Telegram username.\n"
+                "Usage: `/setusername YourHandle`"
+            )
+            return
+
+    if not re.fullmatch(r"[A-Za-z0-9_]{4,32}", uname):
+        await message.reply("❌ Invalid username (5–32 chars: letters, numbers, `_`).")
+        return
+
+    state.settings["caption_username"] = uname
+    state.mark_dirty()
+
+    from core.uploader import get_caption_settings, signature_preview
+    await message.reply(
+        f"✅ Signature username set → @{uname}\n\n"
+        f"**Preview:**\n{signature_preview(get_caption_settings(state))}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # /retryfailed  &  /clear
 # ---------------------------------------------------------------------------
 
@@ -1433,6 +1534,17 @@ def _match_watch(meta: dict, url: str):
     )
 
 
+def _fmt_total_dur(secs: int) -> str:
+    d, r = divmod(secs, 86400)
+    h, r = divmod(r, 3600)
+    m, s = divmod(r, 60)
+    if d:
+        return f"{d}d {h}h {m}m"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m {s}s"
+
+
 def _scan_metadata_caption(
     meta: dict,
     kind: str,
@@ -1440,8 +1552,10 @@ def _scan_metadata_caption(
     item_count: int,
     channel: str = "",
     total_secs: int = 0,
+    date_range: str = "",
+    quality: str = "",
 ) -> str:
-    """Rich Telegram caption for the downloadable scan TXT."""
+    """Rich Telegram caption for the downloadable scan TXT (the 'outside')."""
     meta = meta or {}
     icon = "📋" if kind == "playlist" else ("📺" if kind == "channel" else "📹")
     ch_name  = channel or meta.get("channel_url", "") or "Unknown"
@@ -1450,8 +1564,7 @@ def _scan_metadata_caption(
     pl_title = meta.get("playlist_title", "") or ch_name
     ch_url   = meta.get("channel_url", "")
 
-    h, r = divmod(total_secs, 3600); m, s = divmod(r, 60)
-    dur_s = f"{h}h {m}m" if h else (f"{m}m {s}s" if total_secs else "—")
+    dur_s = _fmt_total_dur(total_secs) if total_secs else "—"
 
     lines = [
         f"{icon} **{pl_title}**{verified}",
@@ -1461,6 +1574,10 @@ def _scan_metadata_caption(
         f"⋄ 𝗩𝗶𝗱𝗲𝗼𝘀: `{item_count}`",
         f"⋄ 𝗧𝗼𝘁𝗮𝗹 𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻: `{dur_s}`",
     ]
+    if date_range:
+        lines.append(f"⋄ 𝗗𝗮𝘁𝗲 𝗥𝗮𝗻𝗴𝗲: `{date_range}`")
+    if quality:
+        lines.append(f"⋄ 𝗤𝘂𝗮𝗹𝗶𝘁𝘆: {quality_label(quality)}")
     if ch_url:
         lines.append(f"⋄ 𝗨𝗥𝗟: {ch_url}")
     lines += [SEP, f"📄 `{filename}`"]
@@ -1515,16 +1632,18 @@ async def _handle_video(client: Client, message: Message, url: str):
     dur     = item.get("duration", "—")
     channel = result.get("channel") or "—"
     meta    = result.get("meta", {}) or {}
+    cur_q   = state.settings.get("quality", "best")
 
     # Send a downloadable TXT with full metadata header.
     try:
         itms     = result["items"]
-        txt_path = generate_txt(itms, channel, "video", meta)
+        txt_path = generate_txt(itms, channel, "video", meta, quality=cur_q)
         await client.send_document(
             chat_id=message.chat.id,
             document=str(txt_path),
             caption=_scan_metadata_caption(
-                meta, "video", txt_path.name, len(itms), channel=channel
+                meta, "video", txt_path.name, len(itms), channel=channel,
+                date_range=date_range_of(itms), quality=cur_q,
             ),
         )
     except Exception as exc:
@@ -1583,22 +1702,18 @@ async def _handle_scan(client: Client, message: Message, url: str, kind: str):
         return
 
     # Send TXT immediately with full metadata in caption.
+    cur_q = state.settings.get("quality", "best")
     try:
-        txt_path = generate_txt(items, channel, kind, meta)
-        # Compute total duration for caption
-        _secs = 0
-        for _itm in items:
-            _p = str(_itm.get("duration", "")).split(":")
-            try:
-                if len(_p) == 3:   _secs += int(_p[0])*3600+int(_p[1])*60+int(_p[2])
-                elif len(_p) == 2: _secs += int(_p[0])*60+int(_p[1])
-            except ValueError: pass
+        txt_path = generate_txt(items, channel, kind, meta, quality=cur_q)
         await client.send_document(
             chat_id=message.chat.id,
             document=str(txt_path),
             caption=_scan_metadata_caption(
                 meta, kind, txt_path.name, len(items),
-                channel=channel, total_secs=_secs
+                channel=channel,
+                total_secs=total_duration_secs(items),
+                date_range=date_range_of(items),
+                quality=cur_q,
             ),
         )
     except Exception as exc:
@@ -1832,6 +1947,72 @@ async def on_callback(client: Client, cq: CallbackQuery):
             pass
         await cq.answer("↻")
 
+    elif data == "watch_this":
+        """Turn the scanned channel/playlist into an auto-watch in one tap."""
+        if not await _cb_require(cq, ROLE_OWNER, ROLE_ADMIN):
+            return
+        cached = _scanned_items_cache.get(chat_id)
+        if not cached or cached.get("kind") == "video":
+            await cq.answer("Scan a channel or playlist first.", show_alert=True)
+            return
+
+        meta  = cached.get("meta", {}) or {}
+        url   = meta.get("source_url", "") or meta.get("channel_url", "")
+        key   = meta.get("channel_url", "") or url
+        title = meta.get("playlist_title") or cached.get("channel") or "Unknown"
+
+        if state.watch_by_key(key, url):
+            await cq.answer("Already being watched — see /watchlist", show_alert=True)
+            return
+
+        wid   = state.next_watch_id()
+        known = [it["id"] for it in cached["items"] if it.get("id")]
+        uid   = cq.from_user.id if cq.from_user else 0
+        state.add_watch(wid, url, key, title, known, added_by=uid)
+        state.save()
+
+        await cq.answer(f"👀 Watching {title}", show_alert=False)
+        await cq.message.reply(
+            f"✅ **𝗪𝗮𝘁𝗰𝗵 𝗔𝗰𝘁𝗶𝘃𝗲!**\n"
+            f"{SEP}\n"
+            f"⋄ 📺 Channel: **{md_escape(title)}**\n"
+            f"⋄ 🆔 Watch ID: `{wid}`\n"
+            f"⋄ 🎬 Known videos: `{len(known)}` _(not re-downloaded)_\n"
+            f"⋄ 📍 Destination: **Global** (`/destinfo`)\n"
+            f"{SEP}\n"
+            f"🆕 Only **new uploads** will be auto-backed up.\n"
+            f"⏰ `/watchtime {wid} 06:00` — daily 6 AM check\n"
+            f"📍 `/watchdest {wid} <chat_id>` — separate destination",
+            reply_markup=kb_watch_actions(wid),
+        )
+
+    # ── Caption settings callbacks (admin) ──────────────────────────────
+    elif data.startswith("cap_"):
+        if not await _cb_require(cq, ROLE_OWNER, ROLE_ADMIN):
+            return
+        which = data.replace("cap_", "")
+        toast = "↻"
+        if which == "main":
+            state.settings["caption_enabled"] = not state.settings.get("caption_enabled", True)
+            toast = "📝 Captions " + ("ON" if state.settings["caption_enabled"] else "OFF")
+        elif which == "sig":
+            state.settings["caption_signature"] = not state.settings.get("caption_signature", True)
+            toast = "⚡ Signature " + ("ON" if state.settings["caption_signature"] else "OFF")
+        elif which == "id":
+            state.settings["caption_show_id"] = not state.settings.get("caption_show_id", False)
+            toast = "🆔 Show ID " + ("ON" if state.settings["caption_show_id"] else "OFF")
+        state.mark_dirty()
+
+        from core.uploader import get_caption_settings
+        try:
+            await cq.message.edit(
+                _caption_panel_text(),
+                reply_markup=kb_caption(get_caption_settings(state)),
+            )
+        except Exception:
+            pass
+        await cq.answer(toast)
+
     # ── User management callbacks (owner) ───────────────────────────────
     elif data.startswith("urole_"):
         if not await _cb_require(cq, ROLE_OWNER):
@@ -1979,6 +2160,18 @@ async def on_callback(client: Client, cq: CallbackQuery):
         elif action == "stats":
             await cq.message.reply(_stats_text())
             await cq.answer()
+
+        elif action == "dashboard":
+            from bot import dashboard as dash_mod
+            paused = state.settings.get("paused", False)
+            msg = await cq.message.reply(
+                dash_mod.format_dashboard(state),
+                reply_markup=kb_processing(paused),
+            )
+            dash_mod.dashboard_msg_id   = msg.id
+            dash_mod._dashboard_chat_id = cq.message.chat.id
+            dash_mod._last_text         = ""
+            await cq.answer("📊 Live dashboard")
 
         elif action == "speedtest":
             await cq.answer("🌐 Starting…")

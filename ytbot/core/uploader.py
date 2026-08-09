@@ -42,40 +42,77 @@ def _del_upload_progress(task_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Caption builder
+# Caption system — settings, signature footer, builder
 # ---------------------------------------------------------------------------
 
-def _build_caption(task: Task, video_num: int = 0) -> str:
-    """Build Telegram caption with count, quality, title, channel, duration, date, link."""
+def get_caption_settings(state) -> Dict[str, Any]:
+    """Caption configuration from state.settings (with safe defaults)."""
+    s = state.settings
+    return {
+        "enabled":   s.get("caption_enabled", True),
+        "signature": s.get("caption_signature", True),
+        "name":      s.get("caption_name", ""),
+        "username":  s.get("caption_username", ""),
+        "show_id":   s.get("caption_show_id", False),
+    }
+
+
+def signature_preview(cfg: Dict[str, Any], video_num: int = 1) -> str:
+    """Render the signature footer (used by uploads and as a live preview)."""
+    bits = []
+    if video_num > 0:
+        bits.append(f"#{video_num}")
+    if cfg.get("signature"):
+        who = []
+        if cfg.get("name"):
+            who.append(f"**{md_escape(cfg['name'])}**")
+        uname = (cfg.get("username") or "").lstrip("@")
+        if uname:
+            who.append(f"@{uname}")
+        if cfg.get("show_id"):
+            who.append(f"🆔 `{Config.OWNER_ID}`")
+        if who:
+            bits.append("Uploaded by " + " ".join(who))
+    if not bits:
+        return ""
+    return f"━━━━━━━━━━━━━━━━━━━━\n⚡ " + " · ".join(bits)
+
+
+def _build_caption(task: Task, video_num: int = 0,
+                   cfg: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Build the Telegram upload caption.
+    Returns '' when captions are disabled (→ send file without caption).
+    """
     from config import quality_label as _qlabel
     from utils.helpers import fmt_yt_date
+
+    cfg = cfg or {"enabled": True}
+    if not cfg.get("enabled", True):
+        return ""
+
     title       = md_escape(task.title or "Untitled")
     channel     = md_escape(task.channel or "—")
     duration    = task.duration or "—"
     upload_time = getattr(task, "upload_time", "") or ""
-    # YYYYMMDD → '5 May 2026' (direct YouTube publish date, clean format)
     yt_date_str = fmt_yt_date(getattr(task, "upload_date", ""), upload_time)
     url         = task.url
-    quality     = getattr(task, "quality", "best")
-    q_label     = _qlabel(quality)
+    q_label     = _qlabel(getattr(task, "quality", "best"))
 
-    # Current Telegram upload timestamp
-    tg_upload_ts = datetime.now().strftime("%d %b %Y  %H:%M")
+    d        = datetime.now()
+    tg_date  = f"{d.day} {d.strftime('%b %Y')}"
 
-    # Header line: #N  |  Quality
-    if video_num > 0:
-        header = f"**#{video_num}**  |  {q_label}\n"
-    else:
-        header = f"{q_label}\n"
-
-    return (
-        f"{header}"
-        f"**{title}**\n\n"
+    body = (
+        f"**{title}**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📺 {channel}\n"
-        f"⏱ `{duration}`  ·  📅 `{yt_date_str}`\n"
-        f"📤 `{tg_upload_ts}`\n"
+        f"{q_label}  ·  ⏱ `{duration}`\n"
+        f"📅 `{yt_date_str}`  ·  📤 `{tg_date}`\n"
         f"🔗 {url}"
     )
+
+    foot = signature_preview(cfg, video_num)
+    return body + ("\n" + foot if foot else "")
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +277,10 @@ async def _upload_split(app: Client, task: Task, caption: str, dest: int):
                     "part":    _lbl,
                 })
 
-            part_caption = f"{caption}\n\n📦 Part {part_label}"
+            part_caption = (
+                f"{caption}\n\n📦 Part {part_label}"
+                if caption else f"📦 Part {part_label}"
+            )
             filename     = Path(part_path).name
 
             logger.info("Uploading %s (%d/%d)", filename, i, total_parts)
@@ -318,7 +358,8 @@ async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
             task.thumb_path = str(candidate_t) if candidate_t.exists() else ""
 
     video_num = state.next_channel_number(task)
-    caption   = _build_caption(task, video_num)
+    cap_cfg   = get_caption_settings(state)
+    caption   = _build_caption(task, video_num, cap_cfg) or None
     dest      = resolve_dest(task)
 
     logger.info("📤 Uploading #%d → %d: %s (%s)",
@@ -330,10 +371,14 @@ async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
     thumb = _get_thumb(task)
     if thumb:
         try:
+            photo_cap = (
+                f"🖼️ **{md_escape(task.title or 'Untitled')}**"
+                if cap_cfg.get("enabled", True) else None
+            )
             photo_msg = await app.send_photo(
                 chat_id=dest,
                 photo=thumb,
-                caption=f"🖼️ **{md_escape(task.title or 'Untitled')}**",
+                caption=photo_cap,
             )
             if photo_msg and photo_msg.id:
                 sent_msg_ids.append(photo_msg.id)
