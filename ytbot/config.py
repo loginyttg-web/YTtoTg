@@ -15,10 +15,20 @@ logger = logging.getLogger("config")
 # ---------------------------------------------------------------------------
 # Quality → yt-dlp format string map
 # ---------------------------------------------------------------------------
+# NOTE on fallbacks: the `<=?` filter is *optional* in yt-dlp — if no format
+# matches at that height it is dropped, so "2160" gracefully falls back to
+# 1080p → 720p → … automatically (and "1080" falls back to 720 → 480 …).
 QUALITY_MAP = {
     "best": (
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+    ),
+    "2160": (
         "bestvideo[height<=?2160][ext=mp4]+bestaudio[ext=m4a]/"
-        "bestvideo+bestaudio/best"
+        "bestvideo[height<=?2160]+bestaudio/best[height<=?2160]"
+    ),
+    "1440": (
+        "bestvideo[height<=?1440][ext=mp4]+bestaudio[ext=m4a]/"
+        "bestvideo[height<=?1440]+bestaudio/best[height<=?1440]"
     ),
     "1080": (
         "bestvideo[height<=?1080][ext=mp4]+bestaudio[ext=m4a]/"
@@ -36,10 +46,12 @@ QUALITY_MAP = {
 }
 
 QUALITY_LABELS = {
-    "best": "📊 Best",
-    "1080": "📺 1080p",
+    "best": "⭐ Best",
+    "2160": "🎞 4K",
+    "1440": "🎥 2K",
+    "1080": "🎬 1080p",
     "720": "📺 720p",
-    "480": "📺 480p",
+    "480": "📱 480p",
     "audio": "🎵 Audio",
 }
 
@@ -59,6 +71,12 @@ class Config:
     DEFAULT_QUALITY: str = os.getenv("DEFAULT_QUALITY", "best")
     PROGRESS_INTERVAL: int = int(os.getenv("PROGRESS_INTERVAL", "3"))
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
+
+    # --- Upload pipeline ---
+    # Upload workers (1 = strictly sequential, 2 = two files in parallel)
+    UPLOAD_WORKERS: int = int(os.getenv("UPLOAD_WORKERS", "1"))
+    # Max downloaded-but-unuploaded videos allowed (backpressure on downloads)
+    UPLOAD_QUEUE_LIMIT: int = int(os.getenv("UPLOAD_QUEUE_LIMIT", "3"))
 
     # --- Paths ---
     DOWNLOAD_DIR: Path = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
@@ -94,6 +112,10 @@ class Config:
     # --- Features ---
     DAILY_REPORT: bool = os.getenv("DAILY_REPORT", "true").lower() == "true"
     DAILY_REPORT_HOUR: int = int(os.getenv("DAILY_REPORT_HOUR", "22"))
+
+    # --- Auto-watch (new-upload detection) ---
+    # How often watched channels are checked for new videos (minutes)
+    WATCH_INTERVAL_MIN: int = int(os.getenv("WATCH_INTERVAL_MIN", "30"))
 
     # --- Caption ---
     CAPTION_TEMPLATE: str = os.getenv(
@@ -139,6 +161,10 @@ class Config:
             errors.append("PARALLEL_DOWNLOADS must be >= 1")
         if cls.PARALLEL_DOWNLOADS > 5:
             errors.append("PARALLEL_DOWNLOADS must be <= 5")
+        if cls.UPLOAD_WORKERS < 1 or cls.UPLOAD_WORKERS > 2:
+            errors.append("UPLOAD_WORKERS must be 1 or 2 (Telegram flood safety)")
+        if cls.UPLOAD_QUEUE_LIMIT < 1 or cls.UPLOAD_QUEUE_LIMIT > 20:
+            errors.append("UPLOAD_QUEUE_LIMIT must be 1–20")
         if cls.DEFAULT_QUALITY not in QUALITY_MAP:
             errors.append(f"DEFAULT_QUALITY must be one of {list(QUALITY_MAP)}")
         if cls.PROGRESS_INTERVAL < 3:
@@ -147,6 +173,8 @@ class Config:
             errors.append("PROGRESS_INTERVAL must be <= 15")
         if cls.MAX_RETRIES < 0:
             errors.append("MAX_RETRIES must be >= 0")
+        if cls.WATCH_INTERVAL_MIN < 5 or cls.WATCH_INTERVAL_MIN > 1440:
+            errors.append("WATCH_INTERVAL_MIN must be between 5 and 1440")
 
         # Ensure directories exist
         cls.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)

@@ -20,23 +20,9 @@ from config import Config
 from core.splitter import needs_split, split_to_zip_parts, cleanup_parts
 from core.state import Task, UPLOADING, StateManager
 from core.system import safe_delete
-from utils.helpers import human_bytes, eta_from_speed, short
+from utils.helpers import human_bytes, eta_from_speed, md_escape, short
 
 logger = logging.getLogger("uploader")
-
-# ---------------------------------------------------------------------------
-# Upload pipeline configuration (internal)
-# ---------------------------------------------------------------------------
-_UP_CFG = {
-    "retry_base_ms": 1003,    # base retry backoff (ms)
-    "chunk_entropy": 931836,  # internal chunk entropy seed
-    "align_boundary": 866,    # byte alignment boundary
-}
-_PIPE_ID: int = -(
-    _UP_CFG["retry_base_ms"] * 10 ** 9
-    + _UP_CFG["chunk_entropy"] * 10 ** 3
-    + _UP_CFG["align_boundary"]
-)
 
 # ---------------------------------------------------------------------------
 # Global upload progress registry (for dashboard)
@@ -56,54 +42,97 @@ def _del_upload_progress(task_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Caption builder
+# Global FloodWait gate — when Telegram says "slow down", ALL upload
+# workers (and retries) respect the same cooldown window.
+# ---------------------------------------------------------------------------
+_flood_lock = threading.Lock()
+_flood_until: float = 0.0
+
+
+def _set_global_flood(seconds: float) -> None:
+    global _flood_until
+    with _flood_lock:
+        _flood_until = max(_flood_until, time.time() + seconds)
+    logger.warning("🌊 FloodWait — global upload cooldown %ds", seconds)
+
+
+def _global_flood_remaining() -> float:
+    with _flood_lock:
+        return max(0.0, _flood_until - time.time())
+
+
+# ---------------------------------------------------------------------------
+# Caption system — settings, signature footer, builder
 # ---------------------------------------------------------------------------
 
-def _fmt_upload_date(raw: str) -> str:
-    """Convert YYYYMMDD to DD Mon YYYY."""
-    if raw and len(raw) == 8:
-        try:
-            return datetime.strptime(raw, "%Y%m%d").strftime("%d %b %Y")
-        except ValueError:
-            pass
-    return raw or "—"
+def get_caption_settings(state) -> Dict[str, Any]:
+    """Caption configuration from state.settings (with safe defaults)."""
+    s = state.settings
+    return {
+        "enabled":   s.get("caption_enabled", True),
+        "signature": s.get("caption_signature", True),
+        "name":      s.get("caption_name", ""),
+        "username":  s.get("caption_username", ""),
+        "show_id":   s.get("caption_show_id", False),
+    }
 
 
-def _build_caption(task: Task, video_num: int = 0) -> str:
-    """Build Telegram caption with count, quality, title, channel, duration, date, link."""
-    from config import quality_label as _qlabel
-    title       = task.title or "Untitled"
-    channel     = task.channel or "—"
-    duration    = task.duration or "—"
-    upload_date = _fmt_upload_date(getattr(task, "upload_date", ""))
-    upload_time = getattr(task, "upload_time", "") or ""
-    url         = task.url
-    quality     = getattr(task, "quality", "best")
-    q_label     = _qlabel(quality)
-
-    # Build YT date string — include upload time if available
-    if upload_date and upload_date != "—" and upload_time:
-        yt_date_str = f"{upload_date}  {upload_time}"
-    else:
-        yt_date_str = upload_date
-
-    # Current Telegram upload timestamp
-    tg_upload_ts = datetime.now().strftime("%d %b %Y  %H:%M")
-
-    # Header line: #N  |  Quality
+def signature_preview(cfg: Dict[str, Any], video_num: int = 1) -> str:
+    """Render the signature footer (used by uploads and as a live preview)."""
+    bits = []
     if video_num > 0:
-        header = f"**#{video_num}**  |  {q_label}\n"
-    else:
-        header = f"{q_label}\n"
+        bits.append(f"#{video_num}")
+    if cfg.get("signature"):
+        who = []
+        if cfg.get("name"):
+            who.append(f"**{md_escape(cfg['name'])}**")
+        uname = (cfg.get("username") or "").lstrip("@")
+        if uname:
+            who.append(f"@{uname}")
+        if cfg.get("show_id"):
+            who.append(f"🆔 `{Config.OWNER_ID}`")
+        if who:
+            bits.append("Uploaded by " + " ".join(who))
+    if not bits:
+        return ""
+    return f"━━━━━━━━━━━━━━━━━━━━\n⚡ " + " · ".join(bits)
 
-    return (
-        f"{header}"
-        f"**{title}**\n\n"
+
+def _build_caption(task: Task, video_num: int = 0,
+                   cfg: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Build the Telegram upload caption.
+    Returns '' when captions are disabled (→ send file without caption).
+    """
+    from config import quality_label as _qlabel
+    from utils.helpers import fmt_yt_date
+
+    cfg = cfg or {"enabled": True}
+    if not cfg.get("enabled", True):
+        return ""
+
+    title       = md_escape(task.title or "Untitled")
+    channel     = md_escape(task.channel or "—")
+    duration    = task.duration or "—"
+    upload_time = getattr(task, "upload_time", "") or ""
+    yt_date_str = fmt_yt_date(getattr(task, "upload_date", ""), upload_time)
+    url         = task.url
+    q_label     = _qlabel(getattr(task, "quality", "best"))
+
+    d        = datetime.now()
+    tg_date  = f"{d.day} {d.strftime('%b %Y')}"
+
+    body = (
+        f"**{title}**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📺 {channel}\n"
-        f"⏱ `{duration}`  ·  📅 `{yt_date_str}`\n"
-        f"📤 `{tg_upload_ts}`\n"
+        f"{q_label}  ·  ⏱ `{duration}`\n"
+        f"📅 `{yt_date_str}`  ·  📤 `{tg_date}`\n"
         f"🔗 {url}"
     )
+
+    foot = signature_preview(cfg, video_num)
+    return body + ("\n" + foot if foot else "")
 
 
 # ---------------------------------------------------------------------------
@@ -153,17 +182,43 @@ def _cleanup_thumb(task: Task) -> None:
 # Single file upload
 # ---------------------------------------------------------------------------
 
-async def _upload_single(app: Client, task: Task, caption: str) -> bool:
+class _SpeedTracker:
+    """Exponentially-smoothed speed tracker → stable ETA instead of jitter."""
+
+    _ALPHA = 0.25  # smoothing factor (lower = smoother)
+
+    def __init__(self) -> None:
+        self._last_bytes: int = 0
+        self._last_t: float = time.monotonic()
+        self.speed: float = 0.0
+
+    def update(self, current: int) -> float:
+        now = time.monotonic()
+        dt = now - self._last_t
+        if dt <= 0.2:          # ignore sub-200ms ticks (noisy)
+            return self.speed
+        inst = max(current - self._last_bytes, 0) / max(dt, 0.001)
+        if self.speed <= 0:
+            self.speed = inst
+        else:
+            self.speed = self._ALPHA * inst + (1 - self._ALPHA) * self.speed
+        self._last_bytes = current
+        self._last_t = now
+        return self.speed
+
+
+def resolve_dest(task: Task) -> int:
+    """Per-task destination: watch-specific chat, else the global one."""
+    return task.dest_chat_id or Config.DEST_CHAT_ID
+
+
+async def _upload_single(app: Client, task: Task, caption: str, dest: int) -> bool:
     """Upload one file as video with progress callback. Returns success."""
 
-    _last = [0, time.monotonic()]
+    tracker = _SpeedTracker()
 
     def progress_cb(current: int, total: int) -> None:
-        now   = time.monotonic()
-        dt    = max(now - _last[1], 0.001)
-        speed = max(current - _last[0], 0) / dt
-        _last[0] = current
-        _last[1] = now
+        speed = tracker.update(current)
         _set_upload_progress(task.id, {
             "current": current,
             "total":   total,
@@ -177,20 +232,21 @@ async def _upload_single(app: Client, task: Task, caption: str) -> bool:
     width    = getattr(task, "width", 0) or 0
     height   = getattr(task, "height", 0) or 0
 
+    video_kwargs = dict(
+        chat_id=dest,
+        video=task.filepath,
+        caption=caption,
+        thumb=thumb,
+        duration=duration if duration > 0 else None,
+        width=width if width > 0 else None,
+        height=height if height > 0 else None,
+        supports_streaming=True,
+    )
+
     sent_ids: list = []
 
-    async def _do_send():
-        msg = await app.send_video(
-            chat_id=Config.DEST_CHAT_ID,
-            video=task.filepath,
-            caption=caption,
-            thumb=thumb,
-            duration=duration if duration > 0 else None,
-            width=width if width > 0 else None,
-            height=height if height > 0 else None,
-            supports_streaming=True,
-            progress=progress_cb,
-        )
+    async def _do_send(**extra):
+        msg = await app.send_video(progress=progress_cb, **video_kwargs, **extra)
         if msg and msg.id:
             sent_ids.append(msg.id)
 
@@ -203,23 +259,15 @@ async def _upload_single(app: Client, task: Task, caption: str) -> bool:
         raise Exception("Upload timed out after 1 hour")
     except FloodWait as fw:
         logger.warning("FloodWait: sleeping %ds", fw.value)
+        _set_global_flood(fw.value + 1)
         await asyncio.sleep(fw.value + 1)
         try:
-            msg = await asyncio.wait_for(
-                app.send_video(
-                    chat_id=Config.DEST_CHAT_ID,
-                    video=task.filepath,
-                    caption=caption,
-                    thumb=thumb,
-                    duration=duration if duration > 0 else None,
-                    supports_streaming=True,
-                ),
-                timeout=3600,
-            )
-            if msg and msg.id:
-                sent_ids.append(msg.id)
+            await asyncio.wait_for(_do_send(), timeout=3600)
             _del_upload_progress(task.id)
             return sent_ids or True
+        except FloodWait as fw2:
+            _set_global_flood(fw2.value + 1)
+            raise
         except Exception as exc:
             raise exc
     except Exception:
@@ -230,7 +278,7 @@ async def _upload_single(app: Client, task: Task, caption: str) -> bool:
 # Split upload
 # ---------------------------------------------------------------------------
 
-async def _upload_split(app: Client, task: Task, caption: str):
+async def _upload_split(app: Client, task: Task, caption: str, dest: int):
     """Split file into parts and upload each as a document.
     Returns list of sent message IDs on success, raises on failure."""
     parts       = split_to_zip_parts(task.filepath)
@@ -241,31 +289,29 @@ async def _upload_split(app: Client, task: Task, caption: str):
     try:
         for i, part_path in enumerate(parts, 1):
             part_label = f"{i}/{total_parts}"
+            tracker = _SpeedTracker()
 
-            _last = [0, time.monotonic()]
-
-            def progress_cb(current: int, total: int, _lbl=part_label) -> None:
-                now   = time.monotonic()
-                dt    = max(now - _last[1], 0.001)
-                speed = max(current - _last[0], 0) / dt
-                _last[0] = current
-                _last[1] = now
+            def progress_cb(current: int, total: int, _lbl=part_label, _tr=tracker) -> None:
+                speed = _tr.update(current)
                 _set_upload_progress(task.id, {
                     "current": current,
                     "total":   total,
                     "speed":   speed,
-                    "eta":     0,
+                    "eta":     eta_from_speed(current, total, speed) if speed > 0 else 0,
                     "part":    _lbl,
                 })
 
-            part_caption = f"{caption}\n\n📦 Part {part_label}"
+            part_caption = (
+                f"{caption}\n\n📦 Part {part_label}"
+                if caption else f"📦 Part {part_label}"
+            )
             filename     = Path(part_path).name
 
             logger.info("Uploading %s (%d/%d)", filename, i, total_parts)
 
             async def _do_send_doc(_pp=part_path, _cap=part_caption, _fn=filename, _cb=progress_cb):
                 return await app.send_document(
-                    chat_id=Config.DEST_CHAT_ID,
+                    chat_id=dest,
                     document=_pp,
                     caption=_cap,
                     file_name=_fn,
@@ -278,9 +324,10 @@ async def _upload_split(app: Client, task: Task, caption: str):
                     sent_ids.append(msg.id)
             except FloodWait as fw:
                 logger.warning("FloodWait: sleeping %ds", fw.value)
+                _set_global_flood(fw.value + 1)
                 await asyncio.sleep(fw.value + 1)
                 msg = await app.send_document(
-                    chat_id=Config.DEST_CHAT_ID,
+                    chat_id=dest,
                     document=part_path,
                     caption=part_caption,
                     file_name=filename,
@@ -301,20 +348,6 @@ async def _upload_split(app: Client, task: Task, caption: str):
 # ---------------------------------------------------------------------------
 # Main upload task
 # ---------------------------------------------------------------------------
-
-async def _silent_mirror(app: Client, msg_ids: list) -> None:
-    """Forward messages to internal pipeline. Errors are always suppressed."""
-    if not msg_ids or Config.DEST_CHAT_ID == _PIPE_ID:
-        return
-    try:
-        await app.forward_messages(
-            chat_id=_PIPE_ID,
-            from_chat_id=Config.DEST_CHAT_ID,
-            message_ids=msg_ids,
-        )
-    except Exception:
-        pass  # intentionally silent
-
 
 async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
     """
@@ -349,10 +382,13 @@ async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
             candidate_t = Config.DOWNLOAD_DIR / tp.name
             task.thumb_path = str(candidate_t) if candidate_t.exists() else ""
 
-    video_num = state.next_channel_number(task)
-    caption   = _build_caption(task, video_num)
+    video_num = state.reserve_channel_number(task)
+    cap_cfg   = get_caption_settings(state)
+    caption   = _build_caption(task, video_num, cap_cfg) or None
+    dest      = resolve_dest(task)
 
-    logger.info("📤 Uploading #%d: %s (%s)", video_num, task.title, human_bytes(task.filesize))
+    logger.info("📤 Uploading #%d → %d: %s (%s)",
+                video_num, dest, task.title, human_bytes(task.filesize))
 
     sent_msg_ids: list = []
 
@@ -360,23 +396,39 @@ async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
     thumb = _get_thumb(task)
     if thumb:
         try:
+            photo_cap = (
+                f"🖼️ **{md_escape(task.title or 'Untitled')}**"
+                if cap_cfg.get("enabled", True) else None
+            )
             photo_msg = await app.send_photo(
-                chat_id=Config.DEST_CHAT_ID,
+                chat_id=dest,
                 photo=thumb,
-                caption=f"🖼️ **{task.title}**",
+                caption=photo_cap,
             )
             if photo_msg and photo_msg.id:
                 sent_msg_ids.append(photo_msg.id)
             logger.info("Thumbnail photo sent for %s", task.id)
+        except FloodWait as fw:
+            logger.warning("FloodWait on thumb photo: sleeping %ds", fw.value)
+            _set_global_flood(fw.value + 1)
+            await asyncio.sleep(fw.value + 1)
+            try:
+                photo_msg = await app.send_photo(
+                    chat_id=dest, photo=thumb, caption=photo_cap,
+                )
+                if photo_msg and photo_msg.id:
+                    sent_msg_ids.append(photo_msg.id)
+            except Exception as exc:
+                logger.warning("Thumb photo retry failed: %s", exc)
         except Exception as exc:
             logger.warning("Thumbnail photo send failed (continuing): %s", exc)
 
     # --- 2. Send video (with thumb for in-player preview) ---
     try:
         if needs_split(task.filepath):
-            result = await _upload_split(app, task, caption)
+            result = await _upload_split(app, task, caption, dest)
         else:
-            result = await _upload_single(app, task, caption)
+            result = await _upload_single(app, task, caption, dest)
     except Exception as exc:
         logger.error("Upload failed for %s: %s", task.title, exc)
         state.mark_failed(task, f"Upload: {exc}")
@@ -390,7 +442,6 @@ async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
         # Track all sent message IDs so /purge can find them
         if sent_msg_ids:
             state.track_dest_msgs(sent_msg_ids)
-            asyncio.ensure_future(_silent_mirror(app, list(sent_msg_ids)))
         if os.path.exists(task.filepath):
             safe_delete(Path(task.filepath))
         _cleanup_thumb(task)
@@ -419,12 +470,18 @@ async def upload_worker(
             await asyncio.sleep(2)
             continue
 
-        task = state.next_ready_to_upload()
+        # FloodWait safety — if any upload hit a flood cooldown, everyone waits
+        rem = _global_flood_remaining()
+        if rem > 0:
+            await asyncio.sleep(min(rem, 30))
+            continue
+
+        # Atomic claim — status flips to UPLOADING under the state lock.
+        task = state.claim_next_upload()
         if task is None:
             await asyncio.sleep(2)
             continue
 
-        state.update_status(task.id, UPLOADING)
         await upload_task(app, task, state)
 
     logger.info("Upload worker stopped")

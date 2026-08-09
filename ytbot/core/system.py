@@ -62,17 +62,22 @@ def has_space_for(size_bytes: int) -> bool:
 
 def disk_report() -> str:
     """Formatted disk report for /diskspace command."""
+    from utils.helpers import bar_smooth
     du = disk_usage()
     used_folder = folder_size(Config.DOWNLOAD_DIR)
-    alert = "⚠️ HIGH USAGE!" if du["percent"] > Config.DISK_ALERT_PERCENT else ""
+    alert = "\n⚠️ **HIGH USAGE!**" if du["percent"] > Config.DISK_ALERT_PERCENT else ""
+
+    bar = bar_smooth(du["used"], du["total"], 14)
 
     return (
-        f"💾 **Disk Usage** {alert}\n\n"
-        f"Total: `{human_bytes(du['total'])}`\n"
-        f"Used:  `{human_bytes(du['used'])}` ({du['percent']}%)\n"
-        f"Free:  `{human_bytes(du['free'])}`\n\n"
-        f"📂 Download folder: `{human_bytes(used_folder)}`\n"
-        f"🛡️ Safety margin: `{human_bytes(Config.safety_margin_bytes())}`"
+        f"❖ **𝗗𝗶𝘀𝗸 𝗨𝘀𝗮𝗴𝗲**{alert}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"`{bar}` **{du['percent']:.1f}%**\n\n"
+        f"⋄ 𝗧𝗼𝘁𝗮𝗹: `{human_bytes(du['total'])}`\n"
+        f"⋄ 𝗨𝘀𝗲𝗱:  `{human_bytes(du['used'])}`\n"
+        f"⋄ 𝗙𝗿𝗲𝗲:  `{human_bytes(du['free'])}`\n\n"
+        f"⋄ 📂 Download folder: `{human_bytes(used_folder)}`\n"
+        f"⋄ 🛡️ Safety margin: `{human_bytes(Config.safety_margin_bytes())}`"
     )
 
 
@@ -88,6 +93,7 @@ def is_disk_alert() -> bool:
 
 def server_report() -> str:
     """RAM, CPU, uptime for /serverinfo."""
+    from utils.helpers import bar_smooth
     ram = psutil.virtual_memory()
     swap = psutil.swap_memory()
     disk = disk_usage()
@@ -98,17 +104,20 @@ def server_report() -> str:
     hours, rem = divmod(rem, 3600)
     mins, secs = divmod(rem, 60)
 
+    cpu_pct = psutil.cpu_percent(interval=0.5)
+
     return (
-        f"🖥 **Server Info**\n\n"
-        f"💻 CPU: `{psutil.cpu_percent(interval=0.5)}%` used "
-        f"({psutil.cpu_count(logical=True)} logical cores)\n"
-        f"🧠 RAM: `{human_bytes(ram.used)} / {human_bytes(ram.total)}` "
-        f"({ram.percent}%)\n"
-        f"📀 Swap: `{human_bytes(swap.used)} / {human_bytes(swap.total)}` "
-        f"({swap.percent}%)\n"
-        f"💾 Disk: `{human_bytes(disk['used'])} / {human_bytes(disk['total'])}` "
-        f"({disk['percent']}%)\n"
-        f"⏱ Uptime: `{days}d {hours}h {mins}m {secs}s`"
+        f"❖ **𝗦𝗲𝗿𝘃𝗲𝗿 𝗜𝗻𝗳𝗼**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💻 **CPU** `{cpu_pct:>3.0f}%`  `{bar_smooth(cpu_pct, 100, 10)}`\n"
+        f"🧠 **RAM** `{ram.percent:>3.0f}%`  `{bar_smooth(ram.used, ram.total, 10)}`  "
+        f"`{human_bytes(ram.used, True)}/{human_bytes(ram.total, True)}`\n"
+        f"📀 **Swap** `{swap.percent:>3.0f}%`  `{bar_smooth(swap.used, max(swap.total, 1), 10)}`\n"
+        f"💾 **Disk** `{disk['percent']:>3.0f}%`  "
+        f"`{bar_smooth(disk['used'], disk['total'], 10)}`  "
+        f"`{human_bytes(disk['free'], True)} free`\n\n"
+        f"⋄ ⏱ Uptime: `{days}d {hours}h {mins}m`\n"
+        f"⋄ 💻 Cores: `{psutil.cpu_count(logical=True)}` logical"
     )
 
 

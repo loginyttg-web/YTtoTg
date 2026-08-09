@@ -14,7 +14,7 @@ from typing import Optional
 
 def human_bytes(n: float, compact: bool = False) -> str:
     """Convert bytes to human-readable string, e.g. '1.23 GB'."""
-    if n < 0:
+    if n is None or n < 0:
         return "0 B"
     for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
         if n < 1024:
@@ -55,6 +55,24 @@ def human_time_short(seconds: float) -> str:
     return f"{s}s"
 
 
+def fmt_yt_date(raw: str, with_time: str = "") -> str:
+    """
+    Convert YouTube's YYYYMMDD to a clean human date: '5 May 2026'.
+    Optionally appends a publish time: '5 May 2026 · 07:41'.
+    """
+    if not raw or len(raw) != 8:
+        return raw or "—"
+    try:
+        from datetime import datetime
+        d = datetime.strptime(raw, "%Y%m%d")
+        s = f"{d.day} {d.strftime('%b %Y')}"
+        if with_time:
+            s += f"  {with_time}"
+        return s
+    except ValueError:
+        return raw
+
+
 # ---------------------------------------------------------------------------
 # Progress bars — multiple styles
 # ---------------------------------------------------------------------------
@@ -62,6 +80,9 @@ def human_time_short(seconds: float) -> str:
 BLOCKS = "█▉▊▋▌▍▎▏ "
 DOTS = "●○"
 SEP = "━━━━━━━━━━━━━━━━━━━━"
+
+# ⅛-fraction glyphs indexed 0..8 (0 = empty, 8 = full)
+_PARTIAL = " ▏▎▍▌▋▊▉█"
 
 
 def progress_bar(current: float, total: float, width: int = 16) -> str:
@@ -78,14 +99,33 @@ def progress_bar(current: float, total: float, width: int = 16) -> str:
     return bar
 
 
-def styled_progress_bar(current: float, total: float, width: int = 14) -> str:
-    """Styled bar with dashes for empty: [████████──────]"""
+def bar_smooth(current: float, total: float, width: int = 12, empty: str = "─") -> str:
+    """
+    Smooth gradient bar with ⅛ precision.
+    e.g. `████████▎───`  (width = 12)
+    """
     if total <= 0:
-        return "[" + "─" * width + "]"
-    ratio = min(max(current / total, 0), 1)
-    filled = int(ratio * width)
-    bar = "█" * filled + "─" * (width - filled)
-    return f"[{bar}]"
+        return empty * width
+    ratio = min(max(current / total, 0.0), 1.0)
+    units = ratio * width * 8
+    filled = int(units // 8)
+    rem = int(units % 8)
+    bar = "█" * filled
+    if filled < width:
+        bar += _PARTIAL[rem]
+        bar += empty * (width - filled - 1)
+    return bar
+
+
+def bar_percent(current: float, total: float, width: int = 12) -> str:
+    """Smooth bar + right-aligned percent: `████▌───────  42%`."""
+    pct = percent(current, total)
+    return f"{bar_smooth(current, total, width)} {pct:>3.0f}%"
+
+
+def styled_progress_bar(current: float, total: float, width: int = 14) -> str:
+    """Styled bar in brackets with smooth fill: [████████▎─────]"""
+    return f"[{bar_smooth(current, total, width)}]"
 
 
 def progress_bar_compact(current: float, total: float, width: int = 10) -> str:
@@ -125,7 +165,20 @@ def eta_from_speed(done: float, total: float, speed: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Speed tier indicator
+# Spinner (for 'active' indicators)
+# ---------------------------------------------------------------------------
+
+SPIN_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+
+def spinner(tick: Optional[float] = None) -> str:
+    """Return the current braille spinner frame (changes ~8x/second)."""
+    t = tick if tick is not None else time.time()
+    return SPIN_FRAMES[int(t * 8) % len(SPIN_FRAMES)]
+
+
+# ---------------------------------------------------------------------------
+# Speed helpers
 # ---------------------------------------------------------------------------
 
 def speed_tier(bytes_per_sec: float) -> str:
@@ -140,11 +193,24 @@ def speed_tier(bytes_per_sec: float) -> str:
 
 def speed_str(bytes_per_sec: float) -> str:
     """Human-friendly speed: `4.2 MB/s` or `850 KB/s`."""
+    if bytes_per_sec <= 0:
+        return "—"
     if bytes_per_sec >= 1_000_000:
         return f"{bytes_per_sec / 1_000_000:.1f} MB/s"
     if bytes_per_sec >= 1_000:
         return f"{bytes_per_sec / 1_000:.0f} KB/s"
     return f"{bytes_per_sec:.0f} B/s"
+
+
+def speed_str_compact(bytes_per_sec: float) -> str:
+    """No-space speed for tight layouts: `18.2MB/s`."""
+    if bytes_per_sec <= 0:
+        return "—"
+    if bytes_per_sec >= 1_000_000:
+        return f"{bytes_per_sec / 1_000_000:.1f}MB/s"
+    if bytes_per_sec >= 1_000:
+        return f"{bytes_per_sec / 1_000:.0f}KB/s"
+    return f"{bytes_per_sec:.0f}B/s"
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +248,23 @@ def sanitize_filename(name: str, max_len: int = 120) -> str:
 
 def short(text: str, limit: int = 38) -> str:
     """Truncate with ellipsis if longer than limit."""
+    text = text or ""
     if len(text) <= limit:
         return text
-    return text[: limit - 1] + "…"
+    return text[: limit - 1].rstrip() + "…"
+
+
+def strip_md(text: str) -> str:
+    """Remove markdown-significant chars (safe for code blocks / plain rows)."""
+    return (text or "").replace("`", "'").replace("*", "").replace("_", " ")
+
+
+def md_escape(text: str) -> str:
+    """Escape Telegram legacy-markdown special chars in dynamic text."""
+    text = text or ""
+    for ch in ("_", "*", "`", "[", "]"):
+        text = text.replace(ch, "\\" + ch)
+    return text
 
 
 def pad_right(text: str, width: int) -> str:

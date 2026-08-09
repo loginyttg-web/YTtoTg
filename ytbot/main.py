@@ -23,10 +23,11 @@ from config import Config
 from utils.logger import setup_logging
 from utils.helpers import human_bytes
 from core.state import StateManager
-from core.system import cleanup_temp, disk_report, is_disk_alert, folder_size
+from core.system import cleanup_temp, disk_report, is_disk_alert
 from core.downloader import download_worker, get_bot_detection_alerted, reset_bot_alert
 from core.uploader import upload_worker
 from core.auth import bot_detection_help
+from core.watcher import watcher_loop
 from bot.client import create_app, set_bot_commands
 from bot.dashboard import dashboard_loop
 from bot.handlers import setup as handlers_setup
@@ -76,30 +77,36 @@ async def daily_report_scheduler(app) -> None:
 
 
 async def _send_daily_report(app) -> None:
-    """Compose and send the daily summary."""
+    """Compose and send the daily summary, then reset daily counters."""
     stats = state.stats
 
-    lines = [
-        f"📊 **Daily Summary Report — {datetime.now().strftime('%d %b %Y')}**",
-        "",
-        f"✅ Completed: `{stats['completed']}` videos",
-        f"❌ Failed: `{stats['failed']}` videos",
-        f"⏭️ Skipped: `{stats['skipped']}` videos",
-        f"📦 Total Size Uploaded: `{human_bytes(stats['bytes_uploaded'])}`",
-        f"⏱️ Total Time: `{_fmt_time(stats['total_time'])}`",
-    ]
+    avg_speed = (
+        stats["bytes_uploaded"] / stats["total_time"]
+        if stats.get("total_time", 0) > 0 else 0
+    )
 
-    du = disk_report()
-    lines.append(f"💾 Disk Space: `{du}`")
+    now = datetime.now()
+    lines = [
+        f"❖ **𝗗𝗮𝗶𝗹𝘆 𝗦𝘂𝗺𝗺𝗮𝗿𝘆 — {now.day} {now.strftime('%b %Y')}**",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"⋄ ✅ Completed: `{stats['completed']}` videos",
+        f"⋄ ❌ Failed: `{stats['failed']}` videos",
+        f"⋄ ⏭️ Skipped: `{stats['skipped']}` videos",
+        f"⋄ 📦 Uploaded: `{human_bytes(stats['bytes_uploaded'])}`",
+        f"⋄ ⏱️ Upload time: `{_fmt_time(stats['total_time'])}`",
+        f"⋄ ⚡ Avg speed: `{human_bytes(avg_speed)}/s`",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
 
     # Failed videos list
     failed = stats.get("failed_list", [])
     if failed:
-        lines.append("\n**Failed Videos:**")
+        lines.append("**❌ Failed Videos:**")
         for i, fv in enumerate(failed[-10:], 1):
             title = fv.get("title", "Unknown")
             error = fv.get("error", "")
             lines.append(f"{i}. \"{title}\" — `{error[:80]}`")
+        lines.append("_→ /retryfailed to re-queue_")
 
     try:
         await app.send_message(
@@ -107,6 +114,8 @@ async def _send_daily_report(app) -> None:
             text="\n".join(lines),
         )
         logger.info("Daily report sent")
+        # Fresh counters for the next day
+        state.reset_daily_stats()
     except Exception as exc:
         logger.error("Failed to send daily report: %s", exc)
 
@@ -202,10 +211,13 @@ def _handle_signal(sig, frame):
 async def _send_startup_ping(app) -> None:
     """Send startup notification to owner and dest channel, delete after 10s."""
     from datetime import datetime
+    watches = state.all_watches()
+    w_on    = sum(1 for w in watches if w.enabled)
     text = (
         "🟢 **YouTube Backup Bot Started!**\n"
         f"🕐 `{datetime.now().strftime('%d %b %Y %H:%M:%S')}`\n"
-        f"⚙️ Workers: `{Config.PARALLEL_DOWNLOADS}` | Quality: `{Config.DEFAULT_QUALITY}`"
+        f"⚙️ Workers: `{Config.PARALLEL_DOWNLOADS}` | Quality: `{Config.DEFAULT_QUALITY}`\n"
+        f"👀 Watching: `{w_on}/{len(watches)}` channels | Auto-check: `{Config.WATCH_INTERVAL_MIN}m`"
     )
     targets = list({Config.OWNER_ID, Config.DEST_CHAT_ID})
     msgs = []
@@ -289,7 +301,10 @@ async def main() -> None:
     await set_bot_commands(app)
 
 
-    logger.info("🤖 Bot started! Owner: %d  Dest: %d", Config.OWNER_ID, Config.DEST_CHAT_ID)
+    logger.info("🤖 Bot started! Owner: %d  Dest: %d  ⬇%d dl · ⬆%d ul workers · queue cap %d",
+                Config.OWNER_ID, Config.DEST_CHAT_ID,
+                Config.PARALLEL_DOWNLOADS, Config.UPLOAD_WORKERS,
+                Config.UPLOAD_QUEUE_LIMIT)
 
     # Startup ping — send to owner & dest channel, auto-delete after 10s
     await _send_startup_ping(app)
@@ -307,14 +322,20 @@ async def main() -> None:
             asyncio.create_task(download_worker(w_id + 1, semaphore, stop_event, state))
         )
 
-    # Upload worker (single, sequential)
-    background_tasks.append(
-        asyncio.create_task(upload_worker(app, stop_event, state))
-    )
+    # Upload workers (1 = strictly sequential, 2 = parallel, FloodWait-shared)
+    for _u in range(Config.UPLOAD_WORKERS):
+        background_tasks.append(
+            asyncio.create_task(upload_worker(app, stop_event, state))
+        )
 
     # Dashboard
     background_tasks.append(
         asyncio.create_task(dashboard_loop(app, stop_event, state))
+    )
+
+    # Channel watcher (auto-detect new uploads)
+    background_tasks.append(
+        asyncio.create_task(watcher_loop(app, stop_event, state))
     )
 
     # Daily report
