@@ -131,6 +131,59 @@ def kb_start() -> InlineKeyboardMarkup:
     ])
 
 
+def kb_watch_actions(watch_id: str) -> InlineKeyboardMarkup:
+    """Buttons shown right after /watch confirms a new subscription."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔍 Check Now", callback_data=f"wcheck_{watch_id}"),
+            InlineKeyboardButton("📋 All Watches", callback_data="watchlist_open"),
+        ],
+    ])
+
+
+def kb_watchlist(watches, state=None) -> InlineKeyboardMarkup:
+    """One row per watch: [⏯ toggle] [📺 title → info] [🗑 remove]."""
+    from utils.helpers import short
+
+    rows = []
+    for w in watches[:20]:
+        dot = "🟢" if w.enabled else "⏸"
+        rows.append([
+            InlineKeyboardButton(dot, callback_data=f"wtoggle_{w.id}"),
+            InlineKeyboardButton(f"📺 {short(w.title or w.url, 26)}", callback_data=f"winfo_{w.id}"),
+            InlineKeyboardButton("🗑", callback_data=f"wdel_{w.id}"),
+        ])
+
+    rows.append([
+        InlineKeyboardButton("🔍 Check All Now", callback_data="wcheckall"),
+        InlineKeyboardButton("↻ Refresh", callback_data="watchlist_refresh"),
+    ])
+    rows.append([InlineKeyboardButton("✖️ Close", callback_data="tasks_close")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_users(users: list) -> InlineKeyboardMarkup:
+    """User management panel. users = [(uid, info), …]"""
+    from utils.helpers import short
+    ROLE_ICON = {"admin": "🛡", "user": "👤"}
+
+    rows = []
+    for uid, info in users[:20]:
+        role = info.get("role", "user")
+        icon = ROLE_ICON.get(role, "👤")
+        name = short(info.get("name") or str(uid), 20)
+        rows.append([
+            InlineKeyboardButton(f"{icon} {name}", callback_data=f"urole_{uid}"),
+            InlineKeyboardButton("🗑", callback_data=f"udel_{uid}"),
+        ])
+
+    rows.append([
+        InlineKeyboardButton("↻ Refresh", callback_data="users_refresh"),
+        InlineKeyboardButton("✖️ Close", callback_data="tasks_close"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
 def kb_channels(history: list, current_id: int) -> InlineKeyboardMarkup:
     """List of saved upload destinations — tap to switch instantly."""
     from utils.helpers import short

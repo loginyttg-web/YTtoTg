@@ -34,6 +34,16 @@ CANCELLED = "cancelled"
 ACTIVE_STATUSES = {PENDING, DOWNLOADING, DOWNLOADED, UPLOADING}
 TERMINAL_STATUSES = {COMPLETED, FAILED, SKIPPED, CANCELLED}
 
+# ---------------------------------------------------------------------------
+# User roles
+# ---------------------------------------------------------------------------
+ROLE_OWNER = "owner"    # full control (only the configured OWNER_ID)
+ROLE_ADMIN = "admin"    # manage watches + queue + settings like quality
+ROLE_USER = "user"      # submit links, view status
+ROLES = (ROLE_OWNER, ROLE_ADMIN, ROLE_USER)
+
+ROLE_ICON = {ROLE_OWNER: "👑", ROLE_ADMIN: "🛡", ROLE_USER: "👤"}
+
 
 # ---------------------------------------------------------------------------
 # Task dataclass
@@ -61,7 +71,9 @@ class Task:
     added_at: float = 0.0
     started_at: float = 0.0
     finished_at: float = 0.0
-    source: str = ""  # 'channel', 'playlist', 'video'
+    source: str = ""        # 'channel', 'playlist', 'video', 'watch'
+    dest_chat_id: int = 0   # 0 → global DEST_CHAT_ID; else channel-specific
+    added_by: int = 0       # Telegram user id that added this task
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -83,6 +95,46 @@ class Task:
 
 
 # ---------------------------------------------------------------------------
+# Watch dataclass — a YouTube channel/playlist being auto-monitored
+# ---------------------------------------------------------------------------
+@dataclass
+class Watch:
+    id: str                 # short id: "w1", "w2", … (stable, for buttons)
+    url: str                # URL that was watched (normalised)
+    key: str = ""           # canonical identity (channel_url if known)
+    title: str = ""         # channel / playlist name
+    dest_chat_id: int = 0   # 0 → global destination
+    dest_chat_title: str = ""
+    quality: str = ""       # "" → global default quality
+    enabled: bool = True
+    interval_min: int = 0   # 0 → global WATCH_INTERVAL_MIN
+    known_ids: List[str] = field(default_factory=list)  # already-seen videos
+    last_check: float = 0.0
+    last_new: int = 0       # new videos found on the last check
+    checks: int = 0
+    added_by: int = 0
+    added_at: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Watch":
+        import dataclasses
+        kwargs = {}
+        for k, f in cls.__dataclass_fields__.items():
+            if k in d:
+                kwargs[k] = d[k]
+            elif f.default is not dataclasses.MISSING:
+                kwargs[k] = f.default
+            elif f.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+                kwargs[k] = f.default_factory()
+            else:
+                kwargs[k] = None
+        return cls(**kwargs)
+
+
+# ---------------------------------------------------------------------------
 # StateManager
 # ---------------------------------------------------------------------------
 class StateManager:
@@ -90,7 +142,9 @@ class StateManager:
 
     def __init__(self, filepath: Path):
         self.filepath = filepath
-        self.tasks: Dict[str, Task] = {}  # key = video_id
+        self.tasks: Dict[str, Task] = {}      # key = video_id
+        self.watches: Dict[str, Watch] = {}   # key = watch.id ("w1", …)
+        self.users: Dict[int, Dict[str, Any]] = {}  # key = telegram user id
         self.settings: Dict[str, Any] = {
             "parallel_downloads": Config.PARALLEL_DOWNLOADS,
             "quality": Config.DEFAULT_QUALITY,
@@ -101,6 +155,9 @@ class StateManager:
             "dest_chat_id": 0,
             "dest_chat_title": "",
             "dest_history": [],
+            "watch_counter": 0,
+            "watcher_paused": False,
+            "watch_interval_min": 0,   # 0 → Config.WATCH_INTERVAL_MIN
         }
         self.stats: Dict[str, Any] = {
             "completed": 0,
@@ -149,6 +206,19 @@ class StateManager:
             self.settings.update(raw.get("settings", self.settings))
             self.stats.update(raw.get("stats", self.stats))
 
+            # Restore watches
+            self.watches = {}
+            for wid, wd in raw.get("watches", {}).items():
+                self.watches[wid] = Watch.from_dict(wd)
+
+            # Restore users (JSON keys are strings → back to int)
+            self.users = {}
+            for uid, ud in raw.get("users", {}).items():
+                try:
+                    self.users[int(uid)] = ud
+                except (TypeError, ValueError):
+                    continue
+
             # Restore saved dest_chat_id into Config so /setchannel persists across restarts
             saved_dest = self.settings.get("dest_chat_id", 0)
             if saved_dest and saved_dest != 0:
@@ -173,7 +243,8 @@ class StateManager:
                 }
 
             self._dirty = False
-            logger.info("State loaded: %d tasks", len(self.tasks))
+            logger.info("State loaded: %d tasks, %d watches, %d users",
+                        len(self.tasks), len(self.watches), len(self.users))
 
     def save(self) -> None:
         """Atomic write: temp file → rename."""
@@ -198,6 +269,8 @@ class StateManager:
     def _serialize(self) -> Dict[str, Any]:
         return {
             "tasks": {vid: t.to_dict() for vid, t in self.tasks.items()},
+            "watches": {wid: w.to_dict() for wid, w in self.watches.items()},
+            "users": {str(uid): u for uid, u in self.users.items()},
             "settings": self.settings,
             "stats": self.stats,
         }
@@ -223,7 +296,8 @@ class StateManager:
     # Task management
     # ------------------------------------------------------------------
     def add_tasks(
-        self, items: List[Dict[str, Any]], source: str, quality: Optional[str] = None
+        self, items: List[Dict[str, Any]], source: str, quality: Optional[str] = None,
+        dest_chat_id: int = 0, added_by: int = 0,
     ) -> Tuple[int, int]:
         """Batch-add tasks without duplicate filtering. Returns (added, 0)."""
         added = 0
@@ -250,6 +324,8 @@ class StateManager:
                     height=item.get("height", 0),
                     added_at=time.time(),
                     source=source,
+                    dest_chat_id=dest_chat_id,
+                    added_by=added_by,
                 )
                 self._order_counter += 1
                 self.tasks[vid] = task  # always overwrite — no duplicate blocking
@@ -258,7 +334,8 @@ class StateManager:
             if added:
                 self._dirty = True
 
-        logger.info("Added %d tasks, skipped %d (source=%s q=%s)", added, skipped, source, q)
+        logger.info("Added %d tasks, skipped %d (source=%s q=%s dest=%s)",
+                    added, skipped, source, q, dest_chat_id or "global")
         return added, skipped
 
     def remove_task(self, video_id: str) -> bool:
@@ -482,6 +559,131 @@ class StateManager:
             if n:
                 self._dirty = True
             return n
+
+    # ------------------------------------------------------------------
+    # Watches — auto-monitored YouTube channels/playlists
+    # ------------------------------------------------------------------
+    def next_watch_id(self) -> str:
+        """Return a fresh short watch id like 'w3'."""
+        with self._lock:
+            n = int(self.settings.get("watch_counter", 0)) + 1
+            self.settings["watch_counter"] = n
+            self._dirty = True
+            return f"w{n}"
+
+    def add_watch(
+        self, watch_id: str, url: str, key: str, title: str,
+        known_ids: List[str], dest_chat_id: int = 0, dest_chat_title: str = "",
+        quality: str = "", added_by: int = 0,
+    ) -> Watch:
+        """Create (or overwrite) a watch subscription."""
+        w = Watch(
+            id=watch_id, url=url, key=key or url, title=title,
+            dest_chat_id=dest_chat_id, dest_chat_title=dest_chat_title,
+            quality=quality, enabled=True,
+            known_ids=list(known_ids),
+            added_by=added_by, added_at=time.time(),
+        )
+        with self._lock:
+            self.watches[watch_id] = w
+            self._dirty = True
+        logger.info("Watch added: %s → %s (dest=%s)", title, url, dest_chat_id or "global")
+        return w
+
+    def get_watch(self, watch_id: str) -> Optional[Watch]:
+        with self._lock:
+            return self.watches.get(watch_id)
+
+    def watch_by_key(self, *candidates: str) -> Optional[Watch]:
+        """Find a watch whose key/url matches any of the candidate URLs."""
+        norm = {c.rstrip("/").lower() for c in candidates if c}
+        if not norm:
+            return None
+        with self._lock:
+            for w in self.watches.values():
+                if (w.key or "").rstrip("/").lower() in norm:
+                    return w
+                if (w.url or "").rstrip("/").lower() in norm:
+                    return w
+        return None
+
+    def remove_watch(self, watch_id: str) -> Optional[Watch]:
+        with self._lock:
+            w = self.watches.pop(watch_id, None)
+            if w:
+                self._dirty = True
+        if w:
+            logger.info("Watch removed: %s (%s)", w.title, watch_id)
+        return w
+
+    def all_watches(self) -> List[Watch]:
+        with self._lock:
+            return sorted(self.watches.values(), key=lambda w: w.added_at)
+
+    def watch_interval(self, watch: Watch) -> int:
+        """Effective check interval (minutes) for a watch."""
+        if watch.interval_min > 0:
+            return watch.interval_min
+        s = int(self.settings.get("watch_interval_min", 0))
+        return s if s > 0 else Config.WATCH_INTERVAL_MIN
+
+    # ------------------------------------------------------------------
+    # Users & roles
+    # ------------------------------------------------------------------
+    def role_of(self, user_id: int) -> Optional[str]:
+        """Return 'owner' | 'admin' | 'user' | None for a Telegram user id."""
+        if user_id == Config.OWNER_ID:
+            return ROLE_OWNER
+        u = self.users.get(user_id)
+        return u.get("role") if u else None
+
+    def add_user(self, user_id: int, role: str, name: str = "", added_by: int = 0) -> None:
+        if role not in (ROLE_ADMIN, ROLE_USER):
+            role = ROLE_USER
+        with self._lock:
+            existing = self.users.get(user_id, {})
+            self.users[user_id] = {
+                "role": role,
+                "name": name or existing.get("name", ""),
+                "added_by": added_by or existing.get("added_by", 0),
+                "added_at": existing.get("added_at") or time.time(),
+            }
+            self._dirty = True
+        logger.info("User added: %d (%s) role=%s", user_id, name, role)
+
+    def remove_user(self, user_id: int) -> bool:
+        with self._lock:
+            removed = self.users.pop(user_id, None) is not None
+            if removed:
+                self._dirty = True
+        return removed
+
+    def set_role(self, user_id: int, role: str) -> bool:
+        if role not in (ROLE_ADMIN, ROLE_USER):
+            return False
+        with self._lock:
+            u = self.users.get(user_id)
+            if not u:
+                return False
+            u["role"] = role
+            self._dirty = True
+        return True
+
+    def all_users(self) -> List[Tuple[int, Dict[str, Any]]]:
+        """All registered users as (user_id, info) sorted by role then name."""
+        order = {ROLE_ADMIN: 0, ROLE_USER: 1}
+        with self._lock:
+            return sorted(self.users.items(),
+                          key=lambda kv: (order.get(kv[1].get("role"), 9),
+                                          kv[1].get("name", "")))
+
+    def ids_with_role(self, *roles: str) -> List[int]:
+        """User ids holding any of the given roles (owner always included)."""
+        out = [Config.OWNER_ID] if ROLE_OWNER in roles else []
+        for uid, u in self.users.items():
+            if u.get("role") in roles:
+                out.append(uid)
+        return out
 
     # ------------------------------------------------------------------
     # Stats

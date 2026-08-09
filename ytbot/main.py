@@ -27,6 +27,7 @@ from core.system import cleanup_temp, disk_report, is_disk_alert
 from core.downloader import download_worker, get_bot_detection_alerted, reset_bot_alert
 from core.uploader import upload_worker
 from core.auth import bot_detection_help
+from core.watcher import watcher_loop
 from bot.client import create_app, set_bot_commands
 from bot.dashboard import dashboard_loop
 from bot.handlers import setup as handlers_setup
@@ -209,10 +210,13 @@ def _handle_signal(sig, frame):
 async def _send_startup_ping(app) -> None:
     """Send startup notification to owner and dest channel, delete after 10s."""
     from datetime import datetime
+    watches = state.all_watches()
+    w_on    = sum(1 for w in watches if w.enabled)
     text = (
         "🟢 **YouTube Backup Bot Started!**\n"
         f"🕐 `{datetime.now().strftime('%d %b %Y %H:%M:%S')}`\n"
-        f"⚙️ Workers: `{Config.PARALLEL_DOWNLOADS}` | Quality: `{Config.DEFAULT_QUALITY}`"
+        f"⚙️ Workers: `{Config.PARALLEL_DOWNLOADS}` | Quality: `{Config.DEFAULT_QUALITY}`\n"
+        f"👀 Watching: `{w_on}/{len(watches)}` channels | Auto-check: `{Config.WATCH_INTERVAL_MIN}m`"
     )
     targets = list({Config.OWNER_ID, Config.DEST_CHAT_ID})
     msgs = []
@@ -322,6 +326,11 @@ async def main() -> None:
     # Dashboard
     background_tasks.append(
         asyncio.create_task(dashboard_loop(app, stop_event, state))
+    )
+
+    # Channel watcher (auto-detect new uploads)
+    background_tasks.append(
+        asyncio.create_task(watcher_loop(app, stop_event, state))
     )
 
     # Daily report

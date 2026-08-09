@@ -21,6 +21,9 @@ A powerful, owner-only Telegram bot that backs up **YouTube videos, playlists an
 
 | Area | What you get |
 |---|---|
+| 👀 **Auto-Watch** | Monitor YouTube channels — new uploads are **auto-detected & backed up** every N minutes |
+| 📍 **Per-channel routing** | Each watched channel uploads to **its own** Telegram chat (teacher → their channel) |
+| 👥 **Multi-user + roles** | 👑 Owner / 🛡 Admin / 👤 User — grant & revoke access from Telegram |
 | 📥 **Sources** | Single videos, playlists, channels (`@handle`, `/channel/`, `/c/`, shorts) |
 | ⚡ **Parallel downloads** | 1–5 workers, atomic task claiming (no double downloads) |
 | 📊 **Live dashboard** | Auto-updating box UI with smooth gradient progress bars, speeds & ETAs |
@@ -28,9 +31,47 @@ A powerful, owner-only Telegram bot that backs up **YouTube videos, playlists an
 | 📤 **Smart uploads** | Thumbnail + video messages, correct dimensions/streaming flag, auto ZIP-splitting for files > 2 GB |
 | 🔁 **Resilience** | Crash recovery, retries with backoff, disk-full & rate-limit deferral, FloodWait handling |
 | 🛡 **Anti-bot layer** | cookies.txt auth, PO-Token support, request throttling with jitter, bot-detection alerts with guided fixes |
-| 📍 **Destinations** | Switch upload target on the fly, saved history, instant tap-to-switch |
 | 📈 **Reports** | Daily summary (auto-reset counters), `/stats` session report, disk/CPU/RAM monitoring |
 | 🧹 **Housekeeping** | Auto temp cleanup, `/purge` tracked-message deletion, `/clear`, `/retryfailed` |
+
+---
+
+## 👀 How Auto-Watch Works
+
+```
+/watch https://youtube.com/@physicswallah  -1001234567890
+```
+
+1. **Snapshot** — the bot scans the channel once and remembers all existing
+   video IDs (say 100 videos). These are **not** downloaded.
+2. **Auto-check** — every `WATCH_INTERVAL_MIN` minutes (default 30) the bot
+   re-scans each watched channel (fast flat scan, no heavy requests).
+3. **Detect & queue** — any video ID not in the snapshot is brand new →
+   it's auto-queued (oldest first) for download + upload **to that watch's
+   own destination chat**.
+4. **Notify** — owner (and whoever added the watch) gets a 🔔 alert listing
+   the new videos.
+
+Useful extras: `/watch <url> all` also backfills existing videos,
+`/backfill w3` queues everything later, `/checknow` forces an immediate scan,
+`/watchdest w3 -100xxx` moves a channel to a different chat.
+
+## 👥 Roles & Permissions
+
+| Command | 👑 Owner | 🛡 Admin | 👤 User |
+|---|---|---|---|
+| `/adduser` `/removeuser` `/setrole` `/users` | ✅ | — | — |
+| `/setchannel` `/setparallel` `/watchinterval` `/purge` `/cookies` | ✅ | — | — |
+| `/watch` `/unwatch` `/watchlist` `/checknow` `/backfill` | ✅ | ✅ | — |
+| `/pause` `/resume` `/cancel` `/resetqueue` `/clear` `/retryfailed` `/setquality` | ✅ | ✅ | — |
+| Send YouTube links (auto-routed if channel is watched) | ✅ | ✅ | ✅ |
+| `/status` `/tasks` `/dashboard` `/stats` `/speedtest` `/whoami` | ✅ | ✅ | ✅ |
+
+```
+/adduser admin      ← reply to the person's message
+/adduser 123456789  ← or pass their user ID
+/users              ← manage everyone with buttons
+```
 
 ---
 
@@ -58,6 +99,27 @@ Required credentials:
 ---
 
 ## 🤖 Commands
+
+### 👀 Auto-Watch
+| Command | Description |
+|---|---|
+| `/watch <url> [dest_chat_id] [all]` | Watch a channel — auto-backup new uploads (optionally to a specific chat, optionally backfill all) |
+| `/watchlist` | All watches with toggle / check / remove buttons |
+| `/unwatch <id or name>` | Stop watching a channel |
+| `/checknow [id]` | Immediately scan one (or all) watches |
+| `/backfill <id>` | Queue ALL videos of a watched channel |
+| `/watchdest <id> <chat_id>` | Move a watch's uploads to another chat |
+| `/watchinterval <minutes>` | Global auto-check interval (5–1440) |
+| `/watchpause` · `/watchresume` | Pause / resume the watcher |
+
+### 👥 Users (owner)
+| Command | Description |
+|---|---|
+| `/adduser [admin\|user]` | Grant access (reply to their message, or `/adduser <id/@user> [role]`) |
+| `/removeuser <id>` | Revoke access |
+| `/setrole <id> <admin\|user>` | Change a user's role |
+| `/users` | Manage all users with inline buttons |
+| `/whoami` | Check your own role & permissions |
 
 ### 📥 Queue
 | Command | Description |
@@ -112,10 +174,11 @@ ytbot/
 │   └── dashboard.py      # live progress dashboard
 ├── core/
 │   ├── scraper.py        # channel/playlist scanning + TXT listings
+│   ├── watcher.py        # auto-detect new uploads on watched channels
 │   ├── downloader.py     # parallel yt-dlp workers, backoff, cancel
 │   ├── uploader.py       # sequential uploads, split parts, captions
 │   ├── splitter.py       # >2GB → ZIP parts
-│   ├── state.py          # JSON persistence + atomic queue ops
+│   ├── state.py          # JSON persistence + atomic queue ops + watches/users
 │   ├── system.py         # disk/CPU/RAM reports, cleanup
 │   └── auth.py           # cookies/PO-Token/throttling layer
 └── utils/

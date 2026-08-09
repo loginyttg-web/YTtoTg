@@ -21,6 +21,23 @@ BOT_COMMANDS: List[BotCommand] = [
     BotCommand("dashboard", "Live progress panel"),
     BotCommand("tasks", "Task list with cancel buttons"),
     BotCommand("stats", "Session statistics"),
+    # 👀 Auto-watch
+    BotCommand("watch", "Auto-backup a channel's NEW uploads"),
+    BotCommand("watchlist", "All watched channels"),
+    BotCommand("unwatch", "Stop watching a channel"),
+    BotCommand("checknow", "Check watches for new videos now"),
+    BotCommand("backfill", "Queue ALL videos of a watched channel"),
+    BotCommand("watchdest", "Change a watch's destination"),
+    BotCommand("watchinterval", "Change auto-check interval (min)"),
+    BotCommand("watchpause", "Pause the watcher"),
+    BotCommand("watchresume", "Resume the watcher"),
+    # 👥 Users
+    BotCommand("adduser", "Grant bot access (reply or user_id)"),
+    BotCommand("removeuser", "Revoke bot access"),
+    BotCommand("setrole", "Change a user's role (admin/user)"),
+    BotCommand("users", "List all authorised users"),
+    BotCommand("whoami", "Show my role & permissions"),
+    # 📥 Queue
     BotCommand("pause", "Pause all processing"),
     BotCommand("resume", "Resume processing"),
     BotCommand("cancel", "Cancel a video by ID/URL"),

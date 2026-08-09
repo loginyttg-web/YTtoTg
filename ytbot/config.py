@@ -95,6 +95,10 @@ class Config:
     DAILY_REPORT: bool = os.getenv("DAILY_REPORT", "true").lower() == "true"
     DAILY_REPORT_HOUR: int = int(os.getenv("DAILY_REPORT_HOUR", "22"))
 
+    # --- Auto-watch (new-upload detection) ---
+    # How often watched channels are checked for new videos (minutes)
+    WATCH_INTERVAL_MIN: int = int(os.getenv("WATCH_INTERVAL_MIN", "30"))
+
     # --- Caption ---
     CAPTION_TEMPLATE: str = os.getenv(
         "CAPTION_TEMPLATE",
@@ -147,6 +151,8 @@ class Config:
             errors.append("PROGRESS_INTERVAL must be <= 15")
         if cls.MAX_RETRIES < 0:
             errors.append("MAX_RETRIES must be >= 0")
+        if cls.WATCH_INTERVAL_MIN < 5 or cls.WATCH_INTERVAL_MIN > 1440:
+            errors.append("WATCH_INTERVAL_MIN must be between 5 and 1440")
 
         # Ensure directories exist
         cls.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)

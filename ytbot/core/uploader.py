@@ -164,7 +164,12 @@ class _SpeedTracker:
         return self.speed
 
 
-async def _upload_single(app: Client, task: Task, caption: str) -> bool:
+def resolve_dest(task: Task) -> int:
+    """Per-task destination: watch-specific chat, else the global one."""
+    return task.dest_chat_id or Config.DEST_CHAT_ID
+
+
+async def _upload_single(app: Client, task: Task, caption: str, dest: int) -> bool:
     """Upload one file as video with progress callback. Returns success."""
 
     tracker = _SpeedTracker()
@@ -185,7 +190,7 @@ async def _upload_single(app: Client, task: Task, caption: str) -> bool:
     height   = getattr(task, "height", 0) or 0
 
     video_kwargs = dict(
-        chat_id=Config.DEST_CHAT_ID,
+        chat_id=dest,
         video=task.filepath,
         caption=caption,
         thumb=thumb,
@@ -226,7 +231,7 @@ async def _upload_single(app: Client, task: Task, caption: str) -> bool:
 # Split upload
 # ---------------------------------------------------------------------------
 
-async def _upload_split(app: Client, task: Task, caption: str):
+async def _upload_split(app: Client, task: Task, caption: str, dest: int):
     """Split file into parts and upload each as a document.
     Returns list of sent message IDs on success, raises on failure."""
     parts       = split_to_zip_parts(task.filepath)
@@ -256,7 +261,7 @@ async def _upload_split(app: Client, task: Task, caption: str):
 
             async def _do_send_doc(_pp=part_path, _cap=part_caption, _fn=filename, _cb=progress_cb):
                 return await app.send_document(
-                    chat_id=Config.DEST_CHAT_ID,
+                    chat_id=dest,
                     document=_pp,
                     caption=_cap,
                     file_name=_fn,
@@ -271,7 +276,7 @@ async def _upload_split(app: Client, task: Task, caption: str):
                 logger.warning("FloodWait: sleeping %ds", fw.value)
                 await asyncio.sleep(fw.value + 1)
                 msg = await app.send_document(
-                    chat_id=Config.DEST_CHAT_ID,
+                    chat_id=dest,
                     document=part_path,
                     caption=part_caption,
                     file_name=filename,
@@ -328,8 +333,10 @@ async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
 
     video_num = state.next_channel_number(task)
     caption   = _build_caption(task, video_num)
+    dest      = resolve_dest(task)
 
-    logger.info("📤 Uploading #%d: %s (%s)", video_num, task.title, human_bytes(task.filesize))
+    logger.info("📤 Uploading #%d → %d: %s (%s)",
+                video_num, dest, task.title, human_bytes(task.filesize))
 
     sent_msg_ids: list = []
 
@@ -338,7 +345,7 @@ async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
     if thumb:
         try:
             photo_msg = await app.send_photo(
-                chat_id=Config.DEST_CHAT_ID,
+                chat_id=dest,
                 photo=thumb,
                 caption=f"🖼️ **{md_escape(task.title or 'Untitled')}**",
             )
@@ -351,9 +358,9 @@ async def upload_task(app: Client, task: Task, state: StateManager) -> bool:
     # --- 2. Send video (with thumb for in-player preview) ---
     try:
         if needs_split(task.filepath):
-            result = await _upload_split(app, task, caption)
+            result = await _upload_split(app, task, caption, dest)
         else:
-            result = await _upload_single(app, task, caption)
+            result = await _upload_single(app, task, caption, dest)
     except Exception as exc:
         logger.error("Upload failed for %s: %s", task.title, exc)
         state.mark_failed(task, f"Upload: {exc}")
