@@ -15,10 +15,20 @@ logger = logging.getLogger("config")
 # ---------------------------------------------------------------------------
 # Quality → yt-dlp format string map
 # ---------------------------------------------------------------------------
+# NOTE on fallbacks: the `<=?` filter is *optional* in yt-dlp — if no format
+# matches at that height it is dropped, so "2160" gracefully falls back to
+# 1080p → 720p → … automatically (and "1080" falls back to 720 → 480 …).
 QUALITY_MAP = {
     "best": (
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+    ),
+    "2160": (
         "bestvideo[height<=?2160][ext=mp4]+bestaudio[ext=m4a]/"
-        "bestvideo+bestaudio/best"
+        "bestvideo[height<=?2160]+bestaudio/best[height<=?2160]"
+    ),
+    "1440": (
+        "bestvideo[height<=?1440][ext=mp4]+bestaudio[ext=m4a]/"
+        "bestvideo[height<=?1440]+bestaudio/best[height<=?1440]"
     ),
     "1080": (
         "bestvideo[height<=?1080][ext=mp4]+bestaudio[ext=m4a]/"
@@ -37,6 +47,8 @@ QUALITY_MAP = {
 
 QUALITY_LABELS = {
     "best": "⭐ Best",
+    "2160": "🎞 4K",
+    "1440": "🎥 2K",
     "1080": "🎬 1080p",
     "720": "📺 720p",
     "480": "📱 480p",

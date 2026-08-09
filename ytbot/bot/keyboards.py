@@ -36,9 +36,9 @@ def kb_quality(current: str = "best") -> InlineKeyboardMarkup:
         return InlineKeyboardButton(f"{mark}{label}", callback_data=f"quality_{qkey}")
 
     return InlineKeyboardMarkup([
-        [btn("⭐ Best", "best")],
-        [btn("🎬 1080p", "1080"), btn("📺 720p", "720"), btn("📱 480p", "480")],
-        [btn("🎵 Audio only", "audio")],
+        [btn("⭐ Best (max available)", "best")],
+        [btn("🎞 4K", "2160"), btn("🎥 2K", "1440"), btn("🎬 1080p", "1080")],
+        [btn("📺 720p", "720"), btn("📱 480p", "480"), btn("🎵 Audio", "audio")],
         [InlineKeyboardButton("← Back", callback_data="quality_back")],
     ])
 

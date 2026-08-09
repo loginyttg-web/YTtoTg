@@ -55,6 +55,24 @@ def human_time_short(seconds: float) -> str:
     return f"{s}s"
 
 
+def fmt_yt_date(raw: str, with_time: str = "") -> str:
+    """
+    Convert YouTube's YYYYMMDD to a clean human date: '5 May 2026'.
+    Optionally appends a publish time: '5 May 2026 · 07:41'.
+    """
+    if not raw or len(raw) != 8:
+        return raw or "—"
+    try:
+        from datetime import datetime
+        d = datetime.strptime(raw, "%Y%m%d")
+        s = f"{d.day} {d.strftime('%b %Y')}"
+        if with_time:
+            s += f"  {with_time}"
+        return s
+    except ValueError:
+        return raw
+
+
 # ---------------------------------------------------------------------------
 # Progress bars — multiple styles
 # ---------------------------------------------------------------------------

@@ -85,8 +85,9 @@ async def _send_daily_report(app) -> None:
         if stats.get("total_time", 0) > 0 else 0
     )
 
+    now = datetime.now()
     lines = [
-        f"❖ **𝗗𝗮𝗶𝗹𝘆 𝗦𝘂𝗺𝗺𝗮𝗿𝘆 — {datetime.now().strftime('%d %b %Y')}**",
+        f"❖ **𝗗𝗮𝗶𝗹𝘆 𝗦𝘂𝗺𝗺𝗮𝗿𝘆 — {now.day} {now.strftime('%b %Y')}**",
         "━━━━━━━━━━━━━━━━━━━━",
         f"⋄ ✅ Completed: `{stats['completed']}` videos",
         f"⋄ ❌ Failed: `{stats['failed']}` videos",

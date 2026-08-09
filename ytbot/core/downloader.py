@@ -192,8 +192,12 @@ def _build_ydl_opts(task: Task, out_dir: Path) -> Dict[str, Any]:
         "outtmpl": outtmpl,
         "merge_output_format": "mp4",
         "continuedl": True,
+        # Grab the REAL YouTube thumbnail (exact one shown on YouTube,
+        # highest resolution available) alongside the video
+        "writethumbnail": True,
         "progress_hooks": [_progress_hook(task.id)],
         "postprocessors": [
+            {"key": "FFmpegThumbnailsConvertor", "format": "jpg"},
             {"key": "FFmpegMetadata"},
             {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
         ],
@@ -237,6 +241,24 @@ def _download_yt_thumbnail(video_id: str, out_dir: Path) -> str:
 
     # Fallback: extract a frame from the video file
     logger.warning("YouTube thumbnail download failed for %s — falling back to ffmpeg", video_id)
+    return ""
+
+
+def _convert_webp_to_jpg(path: str) -> str:
+    """Telegram video thumbs must be JPEG — convert webp if needed."""
+    import subprocess
+    p   = Path(path)
+    out = p.with_suffix(".jpg")
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(p), "-q:v", "2", str(out)],
+            capture_output=True, timeout=30,
+        )
+        if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            p.unlink(missing_ok=True)
+            return str(out)
+    except Exception as exc:
+        logger.warning("webp→jpg conversion failed for %s: %s", path, exc)
     return ""
 
 
@@ -359,10 +381,22 @@ async def download_task(task: Task, state: StateManager) -> bool:
 
     filesize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
 
-    # --- Download actual YouTube thumbnail (best quality), fallback to ffmpeg ---
+    # --- Thumbnail priority ---
+    # 1) yt-dlp's writethumbnail → the EXACT thumbnail YouTube shows,
+    #    in the highest resolution available (maxres / 1080p+)
+    # 2) YouTube CDN fallback (maxresdefault → sddefault → hqdefault)
+    # 3) ffmpeg frame extraction — absolute last resort only
     thumb_path_str = await loop.run_in_executor(
-        None, _download_yt_thumbnail, task.id, out_dir
+        None, _find_thumbnail, out_dir, task.id
     )
+    if thumb_path_str and thumb_path_str.lower().endswith(".webp"):
+        converted = await loop.run_in_executor(None, _convert_webp_to_jpg, thumb_path_str)
+        thumb_path_str = converted  # '' → fall through to CDN
+
+    if not thumb_path_str:
+        thumb_path_str = await loop.run_in_executor(
+            None, _download_yt_thumbnail, task.id, out_dir
+        )
     if not thumb_path_str:
         thumb_path_str = await loop.run_in_executor(
             None, _extract_thumbnail_ffmpeg, str(filepath), task.id, out_dir

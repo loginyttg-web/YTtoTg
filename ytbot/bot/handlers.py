@@ -337,8 +337,11 @@ WATCH_USAGE = (
     "`/watch <channel_url> all` _(also backup existing)_\n\n"
     "⋄ 📍 No chat ID → uses current global destination\n"
     "⋄ 🆕 After setup, only **new uploads** are auto-backed up\n"
-    "⋄ ⏱ Checked every "
-    f"`{Config.WATCH_INTERVAL_MIN}` minutes (default)"
+    f"⋄ ⏱ Default check: every `{Config.WATCH_INTERVAL_MIN}` minutes\n\n"
+    "**Timing options (after watching):**\n"
+    "`/watchtime w1 06:00` — once daily at 6 AM\n"
+    "`/watchinterval w1 720` — every 12h · `1440` = 24h\n"
+    "`/checknow w1` — one-off instant check"
 )
 
 
@@ -503,14 +506,14 @@ def _watchlist_text() -> str:
     now = time.time()
     for w in watches:
         dot   = "🟢" if w.enabled else "⏸"
-        iv    = state.watch_interval(w)
+        sched = state.watch_schedule_label(w)
         ago   = human_time_short(now - w.last_check) + " ago" if w.last_check else "never"
-        nxt   = max(0, int(iv * 60 - (now - w.last_check))) if w.last_check else 0
         dest  = w.dest_chat_title or (str(w.dest_chat_id) if w.dest_chat_id else "global")
+        q     = f" · 🎞 {quality_label(w.quality)}" if w.quality else ""
         rows.append(
             f"{dot} `{w.id}` **{md_escape(short(w.title or w.url, 26))}**\n"
-            f"   📍 {md_escape(short(dest, 22))} · ⏱ {iv}m · "
-            f"🎬 {len(w.known_ids)} known · last: {ago}"
+            f"   📍 {md_escape(short(dest, 20))} · {sched}{q}\n"
+            f"   🎬 {len(w.known_ids)} known · last check: {ago}"
         )
     return head + "\n".join(rows) + f"\n{SEP}\n_⏯ toggle · 📺 details · 🗑 remove_"
 
@@ -643,12 +646,48 @@ async def cmd_watchdest(client: Client, message: Message):
     )
 
 
-@Client.on_message(filters.command("watchinterval") & owner_filter)
+@Client.on_message(filters.command("watchinterval") & admin_filter)
 async def cmd_watchinterval(client: Client, message: Message):
+    """
+    /watchinterval 30       → global default (all watches without override)
+    /watchinterval w1 720   → one watch every 12h (720m) / 1440m = 24h
+    /watchinterval w1 0     → clear per-watch override
+    """
     args = message.text.split()
+
+    # Per-watch mode: /watchinterval w1 720
+    if len(args) >= 3:
+        w = state.get_watch(args[1].lower())
+        if w:
+            try:
+                mins = int(args[2])
+            except ValueError:
+                await message.reply("❌ Minutes must be a number (0 or 5–1440).")
+                return
+            if mins != 0 and (mins < 5 or mins > 1440):
+                await message.reply("❌ Interval must be 5–1440 minutes (or 0 to clear).")
+                return
+            w.interval_min = mins
+            w.daily_at = ""  # interval mode replaces daily schedule
+            state.mark_dirty()
+            if mins == 0:
+                await message.reply(f"✅ `{w.id}` override cleared → global interval")
+            else:
+                h = mins / 60
+                nice = f" ({h:.0f}h)" if h == int(h) else ""
+                await message.reply(f"⏱ `{w.id}` → checked every `{mins}` minutes{nice}")
+            return
+        # else fall through — maybe user typed it wrong
+
     if len(args) < 2:
         cur = state.settings.get("watch_interval_min", 0) or Config.WATCH_INTERVAL_MIN
-        await message.reply(f"Current check interval: `{cur}` minutes.\nUsage: `/watchinterval 30`")
+        await message.reply(
+            f"Global check interval: `{cur}` minutes.\n\n"
+            "Usage:\n"
+            "`/watchinterval 30` — global default\n"
+            "`/watchinterval w1 720` — one watch, every 12h\n"
+            "`/watchtime w1 06:00` — or fixed daily time"
+        )
         return
     try:
         mins = int(args[1])
@@ -660,7 +699,103 @@ async def cmd_watchinterval(client: Client, message: Message):
         return
     state.settings["watch_interval_min"] = mins
     state.mark_dirty()
-    await message.reply(f"⏱ Watch check interval → every `{mins}` minutes")
+    await message.reply(f"⏱ Global watch interval → every `{mins}` minutes")
+
+
+@Client.on_message(filters.command("watchtime") & admin_filter)
+async def cmd_watchtime(client: Client, message: Message):
+    """
+    Schedule a watch:
+      /watchtime w1 06:00   → check once daily at 6:00 AM
+      /watchtime all 06:00  → same for every watch
+      /watchtime w1 off     → back to interval mode
+    """
+    args = message.text.split()
+    if len(args) < 3:
+        await message.reply(
+            "**Usage:**\n"
+            "`/watchtime w1 06:00` — daily at 6 AM\n"
+            "`/watchtime all 22:30` — all watches daily 10:30 PM\n"
+            "`/watchtime w1 off` — back to interval mode\n\n"
+            "_For 12h/24h cycles use `/watchinterval w1 720` / `1440`._"
+        )
+        return
+
+    target = args[1].lower()
+    value  = args[2].strip()
+
+    watches = state.all_watches()
+    if target == "all":
+        targets = watches
+    else:
+        w = next((w for w in watches if w.id == target), None)
+        if not w:
+            await message.reply(f"❌ No watch `{target}`. See `/watchlist`.")
+            return
+        targets = [w]
+
+    if value.lower() == "off":
+        for w in targets:
+            w.daily_at = ""
+        state.mark_dirty()
+        await message.reply(
+            f"⏱ Schedule cleared for `{len(targets)}` watch(es) — "
+            f"back to interval mode."
+        )
+        return
+
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", value)
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        await message.reply("❌ Time must be 24-hour `HH:MM`, e.g. `06:00` or `22:30`.")
+        return
+
+    hh, mm = int(m.group(1)), int(m.group(2))
+    daily  = f"{hh:02d}:{mm:02d}"
+    for w in targets:
+        w.daily_at = daily
+    state.mark_dirty()
+
+    names = ", ".join(f"`{w.id}`" for w in targets[:5])
+    await message.reply(
+        f"⏰ Daily schedule set!\n"
+        f"⋄ Watches: {names}{' …' if len(targets) > 5 else ''}\n"
+        f"⋄ Check time: **{daily}** (every day)\n\n"
+        f"_If the bot is offline at {daily}, it checks right after starting._"
+    )
+
+
+@Client.on_message(filters.command("watchquality") & admin_filter)
+async def cmd_watchquality(client: Client, message: Message):
+    """/watchquality w1 720 — quality override for one watch (or 'default')."""
+    args = message.text.split()
+    if len(args) < 3:
+        await message.reply(
+            "Usage: `/watchquality w1 720`\n"
+            f"Qualities: `{'`, `'.join(VALID_QUALITIES)}` · `default` = global"
+        )
+        return
+
+    w = state.get_watch(args[1].lower())
+    if not w:
+        await message.reply(f"❌ No watch `{args[1]}`. See `/watchlist`.")
+        return
+
+    q = args[2].lower()
+    if q == "default":
+        w.quality = ""
+        state.mark_dirty()
+        await message.reply(f"✅ `{w.id}` → global default quality")
+        return
+    if q not in VALID_QUALITIES:
+        await message.reply(f"❌ Unknown quality `{q}`. Choose: `{'`, `'.join(VALID_QUALITIES)}`")
+        return
+
+    w.quality = q
+    state.mark_dirty()
+    await message.reply(
+        f"✅ **{md_escape(short(w.title or w.id, 30))}** → {quality_label(q)}\n"
+        f"_Applies to future auto-detected videos._"
+    )
 
 
 @Client.on_message(filters.command("watchpause") & admin_filter)
@@ -1095,7 +1230,7 @@ async def cmd_setparallel(client: Client, message: Message):
     await message.reply(f"⚡ Parallel downloads → `{n}` workers")
 
 
-VALID_QUALITIES = ("best", "1080", "720", "480", "audio")
+VALID_QUALITIES = ("best", "2160", "1440", "1080", "720", "480", "audio")
 
 
 @Client.on_message(filters.command(["setquality", "quality"]) & admin_filter)
@@ -1619,12 +1754,15 @@ async def on_callback(client: Client, cq: CallbackQuery):
         if not w:
             await cq.answer("Watch not found", show_alert=True)
             return
-        dest = w.dest_chat_title or (str(w.dest_chat_id) if w.dest_chat_id else "global")
-        ago  = human_time_short(time.time() - w.last_check) + " ago" if w.last_check else "never"
+        dest  = w.dest_chat_title or (str(w.dest_chat_id) if w.dest_chat_id else "global")
+        ago   = human_time_short(time.time() - w.last_check) + " ago" if w.last_check else "never"
+        sched = state.watch_schedule_label(w)
+        q     = quality_label(w.quality) if w.quality else "global"
         await cq.answer(
             f"{short(w.title or w.url, 40)}\n"
-            f"📍 {dest} · ⏱ every {state.watch_interval(w)}m\n"
-            f"🎬 {len(w.known_ids)} known · ✅ {w.checks} checks · last {ago}",
+            f"📍 {dest} · {sched}\n"
+            f"🎞 Quality: {q} · 🎬 {len(w.known_ids)} known\n"
+            f"✅ {w.checks} checks · last {ago}",
             show_alert=True,
         )
 

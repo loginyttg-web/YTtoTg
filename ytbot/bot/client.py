@@ -28,7 +28,9 @@ BOT_COMMANDS: List[BotCommand] = [
     BotCommand("checknow", "Check watches for new videos now"),
     BotCommand("backfill", "Queue ALL videos of a watched channel"),
     BotCommand("watchdest", "Change a watch's destination"),
-    BotCommand("watchinterval", "Change auto-check interval (min)"),
+    BotCommand("watchquality", "Quality override for one watch"),
+    BotCommand("watchtime", "Daily check time (e.g. 06:00)"),
+    BotCommand("watchinterval", "Check interval (12h=720, 24h=1440)"),
     BotCommand("watchpause", "Pause the watcher"),
     BotCommand("watchresume", "Resume the watcher"),
     # 👥 Users

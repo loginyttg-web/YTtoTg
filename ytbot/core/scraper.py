@@ -284,22 +284,15 @@ def generate_txt(
         "",
     ]
 
+    from utils.helpers import fmt_yt_date
     for i, item in enumerate(items, 1):
         title = item.get("title", "Untitled")
         dur   = item.get("duration", "?")
-        date  = item.get("upload_date", "")
-        time_ = item.get("upload_time", "")
-        if date and len(date) == 8:
-            try:
-                from datetime import datetime as _dt
-                date = _dt.strptime(date, "%Y%m%d").strftime("%d %b %Y")
-            except ValueError:
-                pass
+        # YYYYMMDD → '5 May 2026' (clean, no leading zeros)
+        date_fmt = fmt_yt_date(item.get("upload_date", ""))
         url   = item.get("url", "")
-        if date and time_:
-            date_part = f" | 📅 {date}  🕐 {time_}"
-        elif date:
-            date_part = f" | 📅 {date}"
+        if date_fmt and date_fmt != "—":
+            date_part = f" | 📅 {date_fmt}"
         else:
             date_part = ""
         lines.append(f"{i:>4}. {title} | ⏱ {dur}{date_part}")

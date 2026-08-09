@@ -164,10 +164,7 @@ async def watcher_loop(app: Client, stop_event: asyncio.Event, state: StateManag
             continue
 
         now = time.time()
-        due: List[Watch] = [
-            w for w in state.all_watches()
-            if w.enabled and (now - w.last_check) >= state.watch_interval(w) * 60
-        ]
+        due: List[Watch] = [w for w in state.all_watches() if state.watch_due(w, now)]
         if not due:
             continue
 

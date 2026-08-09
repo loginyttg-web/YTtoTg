@@ -27,8 +27,9 @@ A powerful, owner-only Telegram bot that backs up **YouTube videos, playlists an
 | 📥 **Sources** | Single videos, playlists, channels (`@handle`, `/channel/`, `/c/`, shorts) |
 | ⚡ **Parallel downloads** | 1–5 workers, atomic task claiming (no double downloads) |
 | 📊 **Live dashboard** | Auto-updating box UI with smooth gradient progress bars, speeds & ETAs |
-| 🎞 **Quality control** | `best / 1080p / 720p / 480p / audio-only`, per-session, via buttons or command |
-| 📤 **Smart uploads** | Thumbnail + video messages, correct dimensions/streaming flag, auto ZIP-splitting for files > 2 GB |
+| 🎞 **Quality control** | `best / 4K / 2K / 1080p / 720p / 480p / audio` with automatic fallback (4K → 1080 → 720…), per-session and per-watch |
+| 🖼 **Exact thumbnails** | The real YouTube thumbnail in highest resolution — never a random video frame |
+| 📤 **Smart uploads** | Thumbnail + video messages, clean `5 May 2026` publish dates, correct dimensions/streaming flag, auto ZIP-splitting for files > 2 GB |
 | 🔁 **Resilience** | Crash recovery, retries with backoff, disk-full & rate-limit deferral, FloodWait handling |
 | 🛡 **Anti-bot layer** | cookies.txt auth, PO-Token support, request throttling with jitter, bot-detection alerts with guided fixes |
 | 📈 **Reports** | Daily summary (auto-reset counters), `/stats` session report, disk/CPU/RAM monitoring |
@@ -44,17 +45,30 @@ A powerful, owner-only Telegram bot that backs up **YouTube videos, playlists an
 
 1. **Snapshot** — the bot scans the channel once and remembers all existing
    video IDs (say 100 videos). These are **not** downloaded.
-2. **Auto-check** — every `WATCH_INTERVAL_MIN` minutes (default 30) the bot
-   re-scans each watched channel (fast flat scan, no heavy requests).
+2. **Auto-check** — the bot re-scans each watched channel on its schedule
+   (fast flat scan, no heavy requests).
 3. **Detect & queue** — any video ID not in the snapshot is brand new →
    it's auto-queued (oldest first) for download + upload **to that watch's
-   own destination chat**.
+   own destination chat**, with the exact YouTube thumbnail.
 4. **Notify** — owner (and whoever added the watch) gets a 🔔 alert listing
    the new videos.
 
+**Scheduling options** (per watch):
+
+| Mode | Command | Example |
+|---|---|---|
+| Interval | `/watchinterval w1 720` | every 12h (`1440` = 24h) |
+| Fixed daily time | `/watchtime w1 06:00` | once daily at 6 AM |
+| One-off | `/checknow w1` | scan right now, once |
+| Global default | `WATCH_INTERVAL_MIN` env | 30 minutes |
+
+If the bot is offline when a daily slot passes, it catches up right after
+starting — no check is ever missed, and never doubled.
+
 Useful extras: `/watch <url> all` also backfills existing videos,
-`/backfill w3` queues everything later, `/checknow` forces an immediate scan,
-`/watchdest w3 -100xxx` moves a channel to a different chat.
+`/backfill w3` queues everything later,
+`/watchdest w3 -100xxx` moves a channel to a different chat,
+`/watchquality w3 720` saves bandwidth on a specific channel.
 
 ## 👥 Roles & Permissions
 
@@ -109,7 +123,9 @@ Required credentials:
 | `/checknow [id]` | Immediately scan one (or all) watches |
 | `/backfill <id>` | Queue ALL videos of a watched channel |
 | `/watchdest <id> <chat_id>` | Move a watch's uploads to another chat |
-| `/watchinterval <minutes>` | Global auto-check interval (5–1440) |
+| `/watchquality <id> <q\|default>` | Quality override for one watch |
+| `/watchtime <id\|all> HH:MM` | Check once daily at a fixed time (e.g. `06:00`) |
+| `/watchinterval [id] <minutes>` | Global or per-watch interval (`720`=12h, `1440`=24h) |
 | `/watchpause` · `/watchresume` | Pause / resume the watcher |
 
 ### 👥 Users (owner)

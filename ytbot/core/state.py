@@ -108,6 +108,7 @@ class Watch:
     quality: str = ""       # "" → global default quality
     enabled: bool = True
     interval_min: int = 0   # 0 → global WATCH_INTERVAL_MIN
+    daily_at: str = ""      # "HH:MM" → check once a day at this time instead
     known_ids: List[str] = field(default_factory=list)  # already-seen videos
     last_check: float = 0.0
     last_new: int = 0       # new videos found on the last check
@@ -626,6 +627,42 @@ class StateManager:
             return watch.interval_min
         s = int(self.settings.get("watch_interval_min", 0))
         return s if s > 0 else Config.WATCH_INTERVAL_MIN
+
+    def watch_due(self, watch: Watch, now: Optional[float] = None) -> bool:
+        """Is it time to check this watch?
+
+        Two schedule modes:
+        • daily_at = "HH:MM" → due once per day, at/after that wall-clock
+          time (if the bot was off at 6:00 and starts at 9:00, the check
+          still runs once).
+        • otherwise → interval mode: due every `watch_interval()` minutes.
+        """
+        from datetime import datetime, timedelta
+
+        if not watch.enabled:
+            return False
+        now = now or time.time()
+
+        if watch.daily_at:
+            try:
+                hh, mm = (int(x) for x in watch.daily_at.split(":"))
+                if not (0 <= hh <= 23 and 0 <= mm <= 59):
+                    return False
+            except (ValueError, AttributeError):
+                return False
+            local  = datetime.fromtimestamp(now)
+            target = local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if local < target:
+                target -= timedelta(days=1)   # most recent occurrence
+            return watch.last_check < target.timestamp()
+
+        return (now - watch.last_check) >= self.watch_interval(watch) * 60
+
+    def watch_schedule_label(self, watch: Watch) -> str:
+        """Human schedule: '⏰ daily 06:00' or '⏱ every 30m'."""
+        if watch.daily_at:
+            return f"⏰ daily at {watch.daily_at}"
+        return f"⏱ every {self.watch_interval(watch)}m"
 
     # ------------------------------------------------------------------
     # Users & roles

@@ -45,33 +45,19 @@ def _del_upload_progress(task_id: str) -> None:
 # Caption builder
 # ---------------------------------------------------------------------------
 
-def _fmt_upload_date(raw: str) -> str:
-    """Convert YYYYMMDD to DD Mon YYYY."""
-    if raw and len(raw) == 8:
-        try:
-            return datetime.strptime(raw, "%Y%m%d").strftime("%d %b %Y")
-        except ValueError:
-            pass
-    return raw or "—"
-
-
 def _build_caption(task: Task, video_num: int = 0) -> str:
     """Build Telegram caption with count, quality, title, channel, duration, date, link."""
     from config import quality_label as _qlabel
+    from utils.helpers import fmt_yt_date
     title       = md_escape(task.title or "Untitled")
     channel     = md_escape(task.channel or "—")
     duration    = task.duration or "—"
-    upload_date = _fmt_upload_date(getattr(task, "upload_date", ""))
     upload_time = getattr(task, "upload_time", "") or ""
+    # YYYYMMDD → '5 May 2026' (direct YouTube publish date, clean format)
+    yt_date_str = fmt_yt_date(getattr(task, "upload_date", ""), upload_time)
     url         = task.url
     quality     = getattr(task, "quality", "best")
     q_label     = _qlabel(quality)
-
-    # Build YT date string — include upload time if available
-    if upload_date and upload_date != "—" and upload_time:
-        yt_date_str = f"{upload_date}  {upload_time}"
-    else:
-        yt_date_str = upload_date
 
     # Current Telegram upload timestamp
     tg_upload_ts = datetime.now().strftime("%d %b %Y  %H:%M")
