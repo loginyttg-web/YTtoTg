@@ -22,7 +22,7 @@ from typing import List, Optional
 from pyrogram import Client
 
 from config import Config
-from core.auth import apply_request_throttle, is_bot_detection_error
+from core.auth import is_bot_detection_error
 from core.scraper import scan, sort_items
 from core.state import StateManager, Watch
 
@@ -41,11 +41,9 @@ async def check_watch(state: StateManager, watch: Watch) -> List[dict]:
     Returns the list of newly queued items (empty if none).
     Raises on bot-detection errors so the loop can pause & alert.
     """
-    loop = asyncio.get_running_loop()
-
     try:
-        # Throttle lives in blocking time.sleep → run off the event loop
-        await loop.run_in_executor(None, apply_request_throttle)
+        # scan() owns request throttling; doing it here as well doubled every
+        # watcher delay/request budget and contributed to rate limiting.
         result = await scan(watch.url)
     except Exception as exc:
         watch.last_check = time.time()
@@ -181,6 +179,7 @@ async def watcher_loop(app: Client, stop_event: asyncio.Event, state: StateManag
             except Exception as exc:
                 if is_bot_detection_error(str(exc)):
                     state.settings["watcher_paused"] = True
+                    state.settings["watcher_pause_reason"] = "youtube_auth"
                     state.mark_dirty()
                     logger.warning("Watcher paused due to bot detection")
                     await alert_watcher_paused(app, watch, exc)

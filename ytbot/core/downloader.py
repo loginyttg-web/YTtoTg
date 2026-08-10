@@ -19,7 +19,7 @@ from core.auth import (
     build_base_opts,
     apply_request_throttle,
     is_bot_detection_error,
-    bot_detection_help,
+    is_rate_limit_error,
 )
 from core.state import Task, DOWNLOADING, DOWNLOADED, PENDING, FAILED, StateManager
 from core.system import has_space_for
@@ -90,7 +90,46 @@ _defer_until: Dict[str, float] = {}
 _defer_lock = threading.Lock()
 
 DISK_FULL_BACKOFF_SECS = 300   # re-check disk after 5 min
-RATE_LIMIT_BACKOFF_SECS = 600  # cool down 10 min on hourly cap
+RATE_LIMIT_BACKOFF_SECS = 600  # cool down 10 min on configured hourly cap
+
+# A YouTube-side 429 is global to the Railway egress IP, not one video. Keep a
+# process-wide cooldown so other workers/new tasks cannot immediately hammer
+# the same blocked IP. This is separate from Config.RATE_LIMIT.
+_youtube_cooldown_until: float = 0.0
+_youtube_cooldown_started_at: float = 0.0
+_youtube_deferred_ids: set[str] = set()
+_youtube_cooldown_lock = threading.Lock()
+
+
+def activate_youtube_cooldown(seconds: Optional[float] = None) -> bool:
+    """Start/extend cooldown. Return True only for a new incident."""
+    global _youtube_cooldown_until, _youtube_cooldown_started_at
+    duration = seconds or (Config.YOUTUBE_COOLDOWN_MINUTES * 60)
+    now = time.time()
+    with _youtube_cooldown_lock:
+        is_new = _youtube_cooldown_until <= now
+        if is_new:
+            _youtube_cooldown_started_at = now
+        _youtube_cooldown_until = max(_youtube_cooldown_until, now + duration)
+        return is_new
+
+
+def youtube_cooldown_remaining() -> int:
+    with _youtube_cooldown_lock:
+        return max(0, int(_youtube_cooldown_until - time.time()))
+
+
+def clear_youtube_cooldown() -> None:
+    """Clear global and per-task auth deferrals after fresh cookies."""
+    global _youtube_cooldown_until, _youtube_cooldown_started_at
+    with _youtube_cooldown_lock:
+        auth_task_ids = set(_youtube_deferred_ids)
+        _youtube_deferred_ids.clear()
+        _youtube_cooldown_until = 0.0
+        _youtube_cooldown_started_at = 0.0
+    with _defer_lock:
+        for task_id in auth_task_ids:
+            _defer_until.pop(task_id, None)
 
 
 def _defer_task(task_id: str, seconds: float) -> None:
@@ -98,9 +137,17 @@ def _defer_task(task_id: str, seconds: float) -> None:
         _defer_until[task_id] = time.time() + seconds
 
 
+def _defer_youtube_task(task_id: str, seconds: float) -> None:
+    _defer_task(task_id, seconds)
+    with _youtube_cooldown_lock:
+        _youtube_deferred_ids.add(task_id)
+
+
 def _clear_defer(task_id: str) -> None:
     with _defer_lock:
         _defer_until.pop(task_id, None)
+    with _youtube_cooldown_lock:
+        _youtube_deferred_ids.discard(task_id)
 
 
 def _deferred_ids() -> set:
@@ -110,7 +157,11 @@ def _deferred_ids() -> set:
         expired = [k for k, v in _defer_until.items() if v <= now]
         for k in expired:
             _defer_until.pop(k, None)
-        return set(_defer_until.keys())
+        active = set(_defer_until.keys())
+    if expired:
+        with _youtube_cooldown_lock:
+            _youtube_deferred_ids.difference_update(expired)
+    return active
 
 
 def _update_progress(task_id: str, data: Dict[str, Any]) -> None:
@@ -138,6 +189,13 @@ def _mark_bot_alert() -> None:
     global _bot_detection_alerted
     with _alert_lock:
         _bot_detection_alerted = True
+
+
+def register_youtube_block() -> int:
+    """Start the shared cooldown and queue one owner alert per incident."""
+    if activate_youtube_cooldown():
+        _mark_bot_alert()
+    return youtube_cooldown_remaining()
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +372,18 @@ async def download_task(task: Task, state: StateManager) -> bool:
 
     logger.info("⬇️  Starting download: %s (%s)", task.title, task.quality)
 
+    # A YouTube 429 applies to the whole server IP. Do not even run the size
+    # estimate while the shared cooldown is active.
+    cooldown = youtube_cooldown_remaining()
+    if cooldown > 0:
+        logger.warning("YouTube cooldown active; deferring %s for %ds", task.title, cooldown)
+        _defer_youtube_task(task_id, cooldown)
+        state.update_status(
+            task_id, PENDING,
+            error=f"YouTube cooldown active ({cooldown}s remaining)",
+        )
+        return False
+
     # --- Pre-download size estimation ---
     estimated = await _estimate_size(task)
     if estimated > 0 and not has_space_for(estimated):
@@ -429,8 +499,17 @@ def _run_download(url: str, opts: Dict[str, Any]) -> bool:
             ydl.download([url])
         return True
     except yt_dlp.utils.DownloadError as exc:
-        logger.error("yt-dlp DownloadError: %s", exc)
-        raise RuntimeError(str(exc)) from exc
+        # yt-dlp's raised exception is often generic, while its preceding
+        # warning contains the actual HTTP 429 / challenge cause. Preserve that
+        # per-request context for accurate retry and pause decisions.
+        error = str(exc)
+        ydl_logger = opts.get("logger")
+        if hasattr(ydl_logger, "diagnostic_context"):
+            diagnostics = ydl_logger.diagnostic_context()
+            if diagnostics:
+                error = f"{error} | yt-dlp context: {diagnostics}"
+        logger.error("yt-dlp DownloadError: %s", error)
+        raise RuntimeError(error) from exc
     except Exception as exc:
         logger.error("yt-dlp unexpected error: %s", exc)
         raise
@@ -444,16 +523,21 @@ async def _handle_download_error(task: Task, state: StateManager, error: str) ->
     """Classify the error and take appropriate action."""
 
     if is_bot_detection_error(error):
-        logger.warning("⚠️  Bot detection triggered for %s", task.title)
+        reason = "HTTP 429 rate limit" if is_rate_limit_error(error) else "YouTube bot challenge"
+        logger.warning("⚠️ %s triggered for %s", reason, task.title)
 
-        # Pause downloads to avoid hammering YouTube
+        # Preserve the task as pending—auth/network blocks are transient and
+        # should not turn an entire channel queue red or require retryfailed.
+        cooldown = register_youtube_block()
+        _defer_youtube_task(task.id, cooldown)
         state.settings["paused"] = True
+        state.settings["pause_reason"] = "youtube_auth"
+        state.update_status(
+            task.id,
+            PENDING,
+            error=f"{reason}; queue preserved for retry",
+        )
         state.mark_dirty()
-        state.mark_failed(task, f"Bot detection: {error[:200]}")
-
-        # Alert the owner once
-        if not get_bot_detection_alerted():
-            _mark_bot_alert()
 
     else:
         state.mark_failed(task, error)
@@ -561,6 +645,12 @@ async def download_worker(
 
     while not stop_event.is_set():
         if state.settings.get("paused", False):
+            await asyncio.sleep(2)
+            continue
+
+        # Global YouTube-side 429 cooldown. This also protects newly queued
+        # tasks that are not yet present in the per-task defer registry.
+        if youtube_cooldown_remaining() > 0:
             await asyncio.sleep(2)
             continue
 

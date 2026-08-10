@@ -117,25 +117,49 @@ def kb_tasks_page(tasks, page: int = 0, page_size: int = 8) -> InlineKeyboardMar
 
 
 def kb_start() -> InlineKeyboardMarkup:
+    """Compact control-centre keyboard used by /start."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📊 Status",  callback_data="action_status"),
             InlineKeyboardButton("📋 Tasks",   callback_data="action_tasks"),
+            InlineKeyboardButton("📈 Stats",   callback_data="action_stats"),
         ],
         [
-            InlineKeyboardButton("📈 Stats",   callback_data="action_stats"),
             InlineKeyboardButton("📊 Live Dashboard", callback_data="action_dashboard"),
+        ],
+        [
+            InlineKeyboardButton("👀 Watches",       callback_data="watchlist_open"),
+            InlineKeyboardButton("📍 Destinations",  callback_data="action_channels"),
+        ],
+        [
+            InlineKeyboardButton("🔐 YouTube Auth", callback_data="action_auth"),
+            InlineKeyboardButton("❔ Help", callback_data="action_help"),
         ],
         [
             InlineKeyboardButton("💾 Disk",     callback_data="action_diskspace"),
             InlineKeyboardButton("🖥 Server",   callback_data="action_serverinfo"),
             InlineKeyboardButton("🌐 Speed",    callback_data="action_speedtest"),
         ],
-        [
-            InlineKeyboardButton("👀 Watches",       callback_data="watchlist_open"),
-            InlineKeyboardButton("📍 Destinations",  callback_data="action_channels"),
-        ],
     ])
+
+
+def kb_auth(waiting: bool = False) -> InlineKeyboardMarkup:
+    """YouTube authentication panel with actionable controls."""
+    rows = [
+        [InlineKeyboardButton("📎 Upload / Replace Cookies", callback_data="cookie_ready")],
+        [
+            InlineKeyboardButton("🌐 Live Check", callback_data="auth_live_check"),
+            InlineKeyboardButton("↻ File Status", callback_data="auth_refresh"),
+        ],
+        [
+            InlineKeyboardButton("📂 Manual Path", callback_data="auth_manual_path"),
+            InlineKeyboardButton("📖 Export Help", callback_data="cookie_help"),
+        ],
+    ]
+    if waiting:
+        rows.append([InlineKeyboardButton("✖ Cancel Upload", callback_data="cookie_cancel")])
+    rows.append([InlineKeyboardButton("🗑 Close", callback_data="tasks_close")])
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_caption(cfg: dict) -> InlineKeyboardMarkup:

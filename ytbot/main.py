@@ -24,7 +24,12 @@ from utils.logger import setup_logging
 from utils.helpers import human_bytes
 from core.state import StateManager
 from core.system import cleanup_temp, disk_report, is_disk_alert
-from core.downloader import download_worker, get_bot_detection_alerted, reset_bot_alert
+from core.downloader import (
+    download_worker,
+    get_bot_detection_alerted,
+    reset_bot_alert,
+    youtube_cooldown_remaining,
+)
 from core.uploader import upload_worker
 from core.auth import bot_detection_help
 from core.watcher import watcher_loop
@@ -170,10 +175,12 @@ async def bot_detection_alert_loop(app) -> None:
                 await app.send_message(
                     chat_id=Config.OWNER_ID,
                     text=(
-                        "🛑 **YouTube Bot Detection Triggered!**\n\n"
-                        "Downloads have been **paused** to avoid further blocks.\n\n"
+                        "🛑 **YouTube Rate Limit / Bot Challenge**\n\n"
+                        "Downloads are **paused and kept pending**—nothing was lost.\n"
+                        f"Cooldown: `{_fmt_time(youtube_cooldown_remaining())}`\n\n"
                         + bot_detection_help()
-                        + "\n\nRun `/resume` after fixing the issue."
+                        + "\n\nUpload fresh `/cookies`, then run 🌐 Live Check to clear "
+                          "the cooldown safely. Do not repeatedly press Resume during HTTP 429."
                     ),
                 )
                 reset_bot_alert()

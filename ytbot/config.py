@@ -12,6 +12,17 @@ load_dotenv()
 
 logger = logging.getLogger("config")
 
+# Resolve runtime paths relative to the application directory, not the shell's
+# current working directory. This keeps ``python ytbot/main.py``, Railway's
+# ``cd ytbot && python main.py`` and test runners consistent.
+APP_DIR = Path(__file__).resolve().parent
+
+
+def _runtime_path(env_name: str, default: str) -> Path:
+    raw = Path(os.getenv(env_name, default)).expanduser()
+    return raw.resolve() if raw.is_absolute() else (APP_DIR / raw).resolve()
+
+
 # ---------------------------------------------------------------------------
 # Quality → yt-dlp format string map
 # ---------------------------------------------------------------------------
@@ -79,8 +90,12 @@ class Config:
     UPLOAD_QUEUE_LIMIT: int = int(os.getenv("UPLOAD_QUEUE_LIMIT", "3"))
 
     # --- Paths ---
-    DOWNLOAD_DIR: Path = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
-    DATA_DIR: Path = Path(os.getenv("DATA_DIR", "./data"))
+    # Relative values are always based at the ytbot/ application directory.
+    # This avoids accidentally creating a second ./data directory when the bot
+    # is launched from the repository root.
+    BASE_DIR: Path = APP_DIR
+    DOWNLOAD_DIR: Path = _runtime_path("DOWNLOAD_DIR", "./downloads")
+    DATA_DIR: Path = _runtime_path("DATA_DIR", "./data")
 
     # --- YouTube Anti-Bot / Authentication ---
     # Path to cookies.txt (Netscape format) — export from browser
@@ -97,6 +112,9 @@ class Config:
     MAX_SLEEP_INTERVAL: float = float(os.getenv("MAX_SLEEP_INTERVAL", "8"))
     # Rate limit: max downloads per hour (0 = unlimited)
     RATE_LIMIT: int = int(os.getenv("RATE_LIMIT", "0"))
+    # Global cooldown after YouTube returns 429 / bot challenge. A successful
+    # live auth check clears it early; workers wait instead of hammering.
+    YOUTUBE_COOLDOWN_MINUTES: int = int(os.getenv("YOUTUBE_COOLDOWN_MINUTES", "30"))
     # Custom User-Agent override (leave empty for yt-dlp default)
     USER_AGENT: str = os.getenv("USER_AGENT", "")
 
@@ -173,6 +191,8 @@ class Config:
             errors.append("PROGRESS_INTERVAL must be <= 15")
         if cls.MAX_RETRIES < 0:
             errors.append("MAX_RETRIES must be >= 0")
+        if cls.YOUTUBE_COOLDOWN_MINUTES < 5 or cls.YOUTUBE_COOLDOWN_MINUTES > 180:
+            errors.append("YOUTUBE_COOLDOWN_MINUTES must be between 5 and 180")
         if cls.WATCH_INTERVAL_MIN < 5 or cls.WATCH_INTERVAL_MIN > 1440:
             errors.append("WATCH_INTERVAL_MIN must be between 5 and 1440")
 

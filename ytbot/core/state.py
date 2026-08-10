@@ -571,18 +571,34 @@ class StateManager:
 
     def retry_failed(self) -> int:
         """Re-queue all FAILED tasks at the end of the queue. Returns count."""
+        return self.retry_failed_matching()
+
+    def retry_failed_matching(self, markers: Optional[tuple[str, ...]] = None) -> int:
+        """Re-queue failed tasks whose error contains one of *markers*.
+
+        With no markers this preserves `/retryfailed`'s existing all-failures
+        behaviour. Cookie installation uses this targeted form to recover old
+        429/auth failures without retrying unrelated deleted/private videos.
+        """
+        folded_markers = tuple(marker.casefold() for marker in (markers or ()))
         with self._lock:
             n = 0
             for t in self.tasks.values():
-                if t.status == FAILED:
-                    t.status = PENDING
-                    t.error = ""
-                    t.attempts = 0
-                    t.filepath = ""
-                    t.thumb_path = ""
-                    t.order = self._order_counter
-                    self._order_counter += 1
-                    n += 1
+                if t.status != FAILED:
+                    continue
+                if folded_markers and not any(
+                    marker in (t.error or "").casefold() for marker in folded_markers
+                ):
+                    continue
+                t.status = PENDING
+                t.error = ""
+                t.attempts = 0
+                t.filepath = ""
+                t.thumb_path = ""
+                t.finished_at = 0
+                t.order = self._order_counter
+                self._order_counter += 1
+                n += 1
             if n:
                 self._dirty = True
             return n

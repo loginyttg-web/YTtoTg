@@ -9,7 +9,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import yt_dlp
 
 from config import Config
-from core.auth import build_base_opts, apply_request_throttle
+from core.auth import (
+    build_base_opts,
+    apply_request_throttle,
+    is_bot_detection_error,
+    is_hard_youtube_block,
+)
 from utils.helpers import sanitize_filename, classify_url, normalize_channel_url, parse_video_id
 
 logger = logging.getLogger("scraper")
@@ -91,6 +96,16 @@ def _fmt_subscribers(n) -> str:
     return str(n)
 
 
+def _raise_on_blocked_extraction(opts: Dict[str, Any]) -> None:
+    """Turn yt-dlp's otherwise non-fatal 429 warnings into a scan failure."""
+    ydl_logger = opts.get("logger")
+    if not hasattr(ydl_logger, "diagnostic_context"):
+        return
+    diagnostics = ydl_logger.diagnostic_context()
+    if diagnostics and is_hard_youtube_block(diagnostics):
+        raise RuntimeError(f"YouTube blocked the scan: {diagnostics[:500]}")
+
+
 async def scan(url: str) -> Dict[str, Any]:
     """
     Scan a YouTube URL and return structured result.
@@ -116,6 +131,7 @@ async def scan(url: str) -> Dict[str, Any]:
             opts = build_base_opts({"skip_download": True})
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
+            _raise_on_blocked_extraction(opts)
             dur = info.get("duration") or 0
             meta = {
                 "subscribers": _fmt_subscribers(info.get("channel_follower_count")),
@@ -154,6 +170,8 @@ async def scan(url: str) -> Dict[str, Any]:
             }
         except Exception as exc:
             logger.error("Failed to extract single video %s: %s", url, exc)
+            if is_bot_detection_error(str(exc)):
+                raise
             return {"type": "video", "channel": "", "meta": {}, "items": []}
 
     # Channel / playlist
@@ -169,6 +187,7 @@ async def scan(url: str) -> Dict[str, Any]:
         })
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
+        _raise_on_blocked_extraction(opts)
 
         channel, kind_out, items = _parse_items(info)
 
