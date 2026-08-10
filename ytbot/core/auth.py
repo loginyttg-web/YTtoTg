@@ -164,15 +164,96 @@ def _check_rate_limit() -> bool:
 # Cookie detection — which auth method is active?
 # ---------------------------------------------------------------------------
 
+
+def configured_cookie_path() -> Path:
+    """Return the path where a `/cookies` upload should be saved.
+
+    A configured ``COOKIES_PATH`` wins so an operator can keep the file on a
+    mounted volume.  Otherwise the managed default is ``DATA_DIR/cookies.txt``.
+    ``Path`` is deliberately returned even when the file does not exist yet;
+    the upload handler creates its parent directory before saving.
+    """
+    configured = (Config.COOKIES_PATH or "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+        # Be forgiving when an operator points the setting at an existing
+        # storage directory instead of the full filename.
+        return path / "cookies.txt" if path.is_dir() else path
+    return Config.DATA_DIR / "cookies.txt"
+
+
+def active_cookie_path() -> Optional[Path]:
+    """Return the currently usable cookies file, if one exists.
+
+    The default managed location is checked on every call.  This means an
+    operator can manually copy ``data/cookies.txt`` while the bot is already
+    running; the next yt-dlp request sees it without requiring a restart.
+    If a custom ``COOKIES_PATH`` is configured but temporarily missing, the
+    managed default remains a safe fallback.
+    """
+    configured = (Config.COOKIES_PATH or "").strip()
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(configured_cookie_path())
+
+    default_path = Config.DATA_DIR / "cookies.txt"
+    if not candidates or candidates[0] != default_path:
+        candidates.append(default_path)
+
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def validate_cookies_file(path: Path) -> tuple[bool, str]:
+    """Validate the basic Netscape cookie-file format before replacing auth.
+
+    A failed upload must never overwrite a known-good cookies file.  We keep
+    the check intentionally lightweight: yt-dlp remains the authority on
+    individual cookie values, but the standard header catches HTML exports,
+    screenshots renamed to ``.txt``, and other common mistakes.
+    """
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        return False, "The file is not UTF-8 text. Export it again as `cookies.txt`."
+    except OSError as exc:
+        return False, f"Could not read the uploaded file: `{exc}`"
+
+    first_content_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    valid_headers = ("# Netscape HTTP Cookie File", "# HTTP Cookie File")
+    if not first_content_line.startswith(valid_headers):
+        return (
+            False,
+            "This is not a Netscape-format `cookies.txt` file. "
+            "Export it with the **Get cookies.txt LOCALLY** browser extension.",
+        )
+
+    # The header alone is not useful.  Cookie rows use tab-separated Netscape
+    # columns; requiring one protects an existing file from empty exports.
+    def is_cookie_row(line: str) -> bool:
+        # Mozilla stores HttpOnly rows as `#HttpOnly_<domain>...`; despite the
+        # leading `#`, that is a real Netscape cookie row rather than a comment.
+        row = line[len("#HttpOnly_"):] if line.startswith("#HttpOnly_") else line
+        return bool(row and not row.startswith("#") and len(line.split("\t")) >= 7)
+
+    has_cookie_row = any(is_cookie_row(line) for line in text.splitlines())
+    if not has_cookie_row:
+        return False, "The file has no cookie rows. Please export it again from YouTube."
+
+    return True, ""
+
+
 def _cookie_source() -> Optional[str]:
     """
     Determine the active cookie source in priority order:
-      1. COOKIES_PATH (Netscape cookies.txt file)
+      1. COOKIES_PATH or DATA_DIR/cookies.txt (Netscape cookie file)
       2. COOKIES_FROM_BROWSER (extract directly from browser)
-      3. OAUTH_CACHE (OAuth2 token cache file)
+      3. OAUTH_CACHE (legacy reference only)
     Returns None if nothing is configured.
     """
-    if Config.COOKIES_PATH and Path(Config.COOKIES_PATH).exists():
+    if active_cookie_path():
         return "cookiefile"
     if Config.COOKIES_FROM_BROWSER:
         return "browser"
@@ -184,11 +265,12 @@ def _cookie_source() -> Optional[str]:
 def auth_status() -> str:
     """Human-readable auth status for /authstatus display."""
     source = _cookie_source()
+    cookie_path = active_cookie_path()
     po = getattr(Config, "PO_TOKEN", "")
 
     lines = []
-    if source == "cookiefile":
-        lines.append(f"✅ **Cookies file:** `{Config.COOKIES_PATH}`")
+    if source == "cookiefile" and cookie_path:
+        lines.append(f"✅ **Cookies file:** `{cookie_path}`")
     elif source == "browser":
         lines.append(f"✅ **Browser cookies:** `{Config.COOKIES_FROM_BROWSER}`")
     else:
@@ -257,9 +339,10 @@ def build_base_opts(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         }
 
     # ── Auth priority: cookies.txt → browser → OAuth2 ──
-    if Config.COOKIES_PATH and Path(Config.COOKIES_PATH).exists():
-        opts["cookiefile"] = Config.COOKIES_PATH
-        logger.debug("Using cookies from: %s", Config.COOKIES_PATH)
+    cookie_path = active_cookie_path()
+    if cookie_path:
+        opts["cookiefile"] = str(cookie_path)
+        logger.debug("Using cookies from: %s", cookie_path)
 
     elif Config.COOKIES_FROM_BROWSER:
         opts["cookiesfrombrowser"] = (Config.COOKIES_FROM_BROWSER,)
