@@ -140,14 +140,19 @@ Required credentials:
 
 | Where you run it | Cookies file location |
 |---|---|
-| Local (default) | `ytbot/data/cookies.txt` — create the `data/` folder yourself if needed, or just start the bot once and it creates it automatically |
-| Railway (volume at `/data`) | `/data/ytdata/cookies.txt` |
+| Local (default) | `ytbot/data/cookies.txt` — the visible folder contains a safe setup guide; only its `README.md` is tracked |
+| Railway (volume at `/data`) | `/data/ytdata/cookies.txt` when `DATA_DIR=/data/ytdata` |
 | Anywhere | Set `COOKIES_PATH=/full/path/cookies.txt` in `.env` to use any location |
 
-> The `data/` folder is **git-ignored** — that's why you don't see it in the
-> repo. The bot creates it (plus `downloads/`) automatically on first start.
-> Easiest way to load cookies: send `/cookies` in the bot chat, then reply to
-> the bot's message with your exported `cookies.txt` file — no folder needed.
+> Runtime files in `data/` (including cookies, state and logs) are
+> **git-ignored**. Never commit your cookie file. The bot creates the selected
+> data/download folders when it starts, and it also detects a manually copied
+> `data/cookies.txt` on the next download — no restart required.
+>
+> **Easiest upload:** send `/cookies` in the bot chat, then either **reply** to
+> its instruction with the exported `cookies.txt` document **or send the file
+> directly in the same chat within 15 minutes**. The bot confirms the saved
+> path and validates the Netscape cookie format before replacing any old file.
 
 ## 🚂 Deploy on Railway (recommended)
 
@@ -173,7 +178,8 @@ Required credentials:
    | `DEFAULT_QUALITY` | `best` |
 
 4. **Deploy.** After the startup ping arrives, send `/cookies` in the bot chat and
-   reply with your `cookies.txt` — it's saved on the volume and survives redeploys.
+   reply with your `cookies.txt` **or send it directly within 15 minutes** — it's
+   saved on the volume and survives redeploys.
 5. `/watch <channel> <DEST_CHAT_ID>` and you're fully automatic.
 
 The repo ships `railway.json` + `nixpacks.toml` (Python 3.11 + Node.js for
@@ -332,10 +338,24 @@ ytbot/
 **🍪 YouTube says "Sign in to confirm you're not a robot"**
 
 1. Install the *Get cookies.txt LOCALLY* browser extension.
-2. Log in to YouTube, export `cookies.txt`, then either:
-   - send `/cookies` in the bot chat and **reply with the file**, or
-   - put the file at `ytbot/data/cookies.txt` (see table above) and restart.
+2. Log in to YouTube, export the **Netscape-format** `cookies.txt`, then either:
+   - send `/cookies` in the bot chat and **reply with the document**, or send
+     the document directly in that chat within 15 minutes, or
+   - put the file at `ytbot/data/cookies.txt` (or your configured `DATA_DIR`)
+     — the next download detects it without a restart.
 3. Check with `/authstatus`.
+
+**🍪 `/cookies` ke baad file bhejne par kuch nahi hota**
+
+- File **Document/File** ke roop mein send karein, photo ya pasted text ke
+  roop mein nahi. `/cookies` ke baad 15 minutes ke andar direct send karna bhi
+  supported hai; reply karna optional hai.
+- Command sirf `OWNER_ID` use kar sakta hai. Confirmation `✅ Cookies Loaded`
+  aani chahiye; phir `/authstatus` run karein.
+- File ka first line normally `# Netscape HTTP Cookie File` hota hai. Chrome
+  JSON export ya `.txt` naam wali HTML file valid cookies nahi hoti.
+- Manual local path: `ytbot/data/cookies.txt`. Railway with
+  `DATA_DIR=/data/ytdata`: `/data/ytdata/cookies.txt`.
 
 **⬇️ Downloads fail / nothing gets queued**
 

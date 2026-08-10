@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Optional
 
 from pyrogram import Client, filters
@@ -31,7 +32,12 @@ from core.system import (
     server_report as sys_server_report,
     run_speedtest,
 )
-from core.auth import auth_status, bot_detection_help
+from core.auth import (
+    auth_status,
+    bot_detection_help,
+    configured_cookie_path,
+    validate_cookies_file,
+)
 from core.downloader import reset_bot_alert, trigger_cancel
 from core.watcher import check_watch
 from utils.helpers import (
@@ -1203,57 +1209,131 @@ async def cmd_logs(client: Client, message: Message):
 # /cookies  (owner only)
 # ---------------------------------------------------------------------------
 
+# A direct document upload is allowed for a short window after `/cookies`.
+# Requiring a reply used to be easy to miss in Telegram and made a normal
+# `cookies.txt` upload look as if the bot had ignored it.
+_COOKIE_UPLOAD_TIMEOUT_SECONDS = 15 * 60
+_cookie_upload_requests: dict[int, tuple[int, int, float]] = {}
+
+
+def _pending_cookie_upload(chat_id: int) -> Optional[tuple[int, int, float]]:
+    """Return a non-expired cookie-upload request for a chat, if any."""
+    pending = _cookie_upload_requests.get(chat_id)
+    if pending and pending[2] <= time.monotonic():
+        _cookie_upload_requests.pop(chat_id, None)
+        return None
+    return pending
+
+
+def _is_cookie_upload(message: Message) -> bool:
+    """Accept a document replying to `/cookies`/the prompt, or a pending upload."""
+    if not getattr(message, "document", None):
+        return False
+
+    pending = _pending_cookie_upload(message.chat.id)
+    reply = message.reply_to_message
+
+    # After `/cookies`, the owner may send the file directly (no reply needed)
+    # or reply to either the command or the instruction message.
+    if pending:
+        command_id, prompt_id, _expires_at = pending
+        if reply is None or reply.id in (command_id, prompt_id):
+            return True
+
+    # Keep accepting an explicit reply after a bot restart, when in-memory
+    # pending state is gone but the visible `/cookies` instruction remains.
+    if not reply:
+        return False
+    raw_reply_text = f"{reply.text or ''}\n{reply.caption or ''}"
+    reply_text = raw_reply_text.casefold()
+    return bool(
+        re.search(r"(?m)^/cookies(?:@[a-z0-9_]+)?(?:\s|$)", reply_text)
+        or ("upload" in reply_text and "cookies" in reply_text)
+        # The instruction heading uses Telegram display Unicode, which does
+        # not case-fold to ASCII. Keep an explicit marker for restart safety.
+        or ("𝗨𝗽𝗹𝗼𝗮𝗱" in raw_reply_text and "𝗖𝗼𝗼𝗸𝗶𝗲𝘀" in raw_reply_text)
+    )
+
+
+def cookie_upload_candidate(_filter, _client, message: Message) -> bool:
+    """Pyrogram filter wrapper for a requested cookies document."""
+    return _is_cookie_upload(message)
+
+
+cookie_upload_filter = filters.create(cookie_upload_candidate)
+
+
 @Client.on_message(filters.command("cookies") & owner_filter)
 async def cmd_cookies(client: Client, message: Message):
-    await message.reply(
+    cookies_path = configured_cookie_path()
+    prompt = await message.reply(
         f"❖ **𝗨𝗽𝗹𝗼𝗮𝗱 𝗖𝗼𝗼𝗸𝗶𝗲𝘀**\n"
         f"{SEP}\n"
         f"1️⃣ Install _Get cookies.txt LOCALLY_ extension\n"
         f"2️⃣ Open YouTube while logged in\n"
         f"3️⃣ Export `cookies.txt` from the extension\n"
-        f"4️⃣ **Reply to this message** with the file\n\n"
-        f"⚠️ File must be named `cookies.txt`"
+        f"4️⃣ Reply to this message **or send the document directly here within 15 minutes**\n\n"
+        f"📁 Manual path: `{cookies_path}`\n"
+        f"⚠️ Send it as a **file/document**, not as a photo or pasted text."
+    )
+    _cookie_upload_requests[message.chat.id] = (
+        message.id,
+        prompt.id,
+        time.monotonic() + _COOKIE_UPLOAD_TIMEOUT_SECONDS,
     )
 
 
-@Client.on_message(filters.document & owner_filter & filters.reply)
+@Client.on_message(filters.document & owner_filter & cookie_upload_filter)
 async def on_cookies_upload(client: Client, message: Message):
-    if not message.reply_to_message:
-        return
-
-    reply_text = message.reply_to_message.text or ""
-    if "Upload" not in reply_text and "cookies" not in reply_text and "𝗖𝗼𝗼𝗸𝗶𝗲𝘀" not in reply_text:
-        return
-
+    """Validate and atomically install a cookies.txt document from the owner."""
     doc = message.document
-    if not doc or not doc.file_name:
-        return
-    if not doc.file_name.endswith(".txt"):
-        await message.reply("❌ Please upload a `.txt` file.")
+    file_name = (doc.file_name if doc and doc.file_name else "").strip()
+    if not file_name.lower().endswith(".txt"):
+        await message.reply("❌ Please send the exported `cookies.txt` as a `.txt` document.")
         return
 
-    cookies_path = Config.DATA_DIR / "cookies.txt"
+    cookies_path = configured_cookie_path()
+    # Download outside the final location.  A broken/HTML file must not erase
+    # a working login cookie file that yt-dlp is currently using.
+    cookies_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = cookies_path.with_name(f".{cookies_path.name}.{message.id}.upload")
+    downloaded_path = temp_path
+
     try:
-        await client.download_media(message, file_name=str(cookies_path))
+        downloaded = await client.download_media(message, file_name=str(temp_path))
+        if not downloaded:
+            raise RuntimeError("Telegram did not return a downloaded file path")
+        downloaded_path = Path(downloaded)
+
+        valid, error = validate_cookies_file(downloaded_path)
+        if not valid:
+            await message.reply(f"⚠️ **Cookies not changed**\n{error}")
+            logger.warning("Rejected invalid cookies upload from %s: %s", message.chat.id, error)
+            return
+
+        os.replace(downloaded_path, cookies_path)
     except Exception as exc:
-        await message.reply(f"❌ Failed to save file: `{exc}`")
+        logger.exception("Failed to save cookies upload")
+        await message.reply(f"❌ Failed to save cookies file: `{exc}`")
         return
-
-    first_line = ""
-    try:
-        first_line = cookies_path.read_text(encoding="utf-8").split("\n")[0].strip()
-    except Exception:
-        pass
-
-    if not first_line.startswith("# Netscape HTTP Cookie File"):
-        await message.reply("⚠️ File doesn't look like a valid cookies.txt.")
+    finally:
+        # `os.replace` moves the temporary file, so these are normally absent.
+        # Clean up only temporary names; never touch the active cookie file.
+        for path in (temp_path, downloaded_path):
+            if path != cookies_path:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     Config.COOKIES_PATH = str(cookies_path)
+    _cookie_upload_requests.pop(message.chat.id, None)
     reset_bot_alert()
 
     await message.reply(
         f"✅ **𝗖𝗼𝗼𝗸𝗶𝗲𝘀 𝗟𝗼𝗮𝗱𝗲𝗱**\n"
         f"{SEP}\n"
+        f"⋄ Saved at: `{cookies_path}`\n"
         f"⋄ Size: `{cookies_path.stat().st_size:,}` bytes\n"
         f"⋄ Run `/authstatus` to verify"
     )
