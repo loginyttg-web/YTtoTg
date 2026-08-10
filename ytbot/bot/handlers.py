@@ -1172,7 +1172,7 @@ async def cmd_serverinfo(client: Client, message: Message):
 
 @Client.on_message(filters.command("speedtest") & user_filter)
 async def cmd_speedtest(client: Client, message: Message):
-    wait_msg = await message.reply("🌐 _Running speed test (25 MB download)…_")
+    wait_msg = await message.reply("🌐 _Running speedtest: 200 MB DL + 200 MB UL + ping (≥10s)…_")
     result   = await run_speedtest()
     await wait_msg.edit(result)
 
@@ -1265,16 +1265,28 @@ cookie_upload_filter = filters.create(cookie_upload_candidate)
 
 @Client.on_message(filters.command("cookies") & owner_filter)
 async def cmd_cookies(client: Client, message: Message):
+    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     cookies_path = configured_cookie_path()
+    cur = auth_status()
+    # Check current cookies quickly
+    has_cookies = "✅" in cur
     prompt = await message.reply(
         f"❖ **𝗨𝗽𝗹𝗼𝗮𝗱 𝗖𝗼𝗼𝗸𝗶𝗲𝘀**\n"
         f"{SEP}\n"
-        f"1️⃣ Install _Get cookies.txt LOCALLY_ extension\n"
-        f"2️⃣ Open YouTube while logged in\n"
-        f"3️⃣ Export `cookies.txt` from the extension\n"
-        f"4️⃣ Reply to this message **or send the document directly here within 15 minutes**\n\n"
-        f"📁 Manual path: `{cookies_path}`\n"
-        f"⚠️ Send it as a **file/document**, not as a photo or pasted text."
+        f"{cur}\n"
+        f"{SEP}\n"
+        f"**Kaise bhejein:**\n"
+        f"1️⃣ Chrome me **Get cookies.txt LOCALLY** extension install karo\n"
+        f"2️⃣ `youtube.com` par login → extension se **Export** → `cookies.txt` milega\n"
+        f"3️⃣ **Is message ko Reply karke** file ko **Document** ke roop me bhejo\n"
+        f"   _— ya bina reply ke isi chat me 15 min ke andar seedha bhejo_\n\n"
+        f"📁 Save: `{cookies_path}`\n"
+        f"⚠️ Photo / text paste nahi — sirf `.txt` document\n"
+        f"💡 Export ke turant baad bhejo, cookies jaldi expire hote hain!",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 /authstatus check", callback_data="noop")],
+            [InlineKeyboardButton("📖 Guide", url="https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp")],
+        ])
     )
     _cookie_upload_requests[message.chat.id] = (
         message.id,
@@ -1339,6 +1351,25 @@ async def on_cookies_upload(client: Client, message: Message):
     )
     logger.info("Cookies uploaded, saved to %s", cookies_path)
 
+
+
+@Client.on_message(filters.document & owner_filter)
+async def on_any_owner_document(client: Client, message: Message):
+    """If owner sends a .txt document outside the cookie window, give a hint."""
+    # If it was already handled as cookie upload, skip
+    if _is_cookie_upload(message):
+        return
+    doc = message.document
+    name = (doc.file_name or "").lower()
+    # Only hint for plausible cookies.txt uploads
+    if "cookie" in name and name.endswith(".txt"):
+        pending = _pending_cookie_upload(message.chat.id)
+        if not pending:
+            await message.reply(
+                f"⚠️ `cookies.txt` mila par koi active request nahi hai\\n"
+                f"Pehele `/cookies` bhejo, phir usi message ko **Reply** karke file bhejo.\\n"
+                f"📁 Path: `{configured_cookie_path()}`"
+            )
 
 # ---------------------------------------------------------------------------
 # /authstatus  &  /ytdlpupdate

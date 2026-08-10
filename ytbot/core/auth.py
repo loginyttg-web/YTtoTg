@@ -22,8 +22,13 @@ from config import Config
 
 logger = logging.getLogger("auth")
 
-# Node.js path for yt-dlp JS challenge solving
-_NODE_PATH: str = shutil.which("node") or ""
+# JS runtimes for yt-dlp n/sig challenge solving (node + deno)
+# Computed lazily inside build_base_opts so PATH changes at startup are seen.
+def _node_path() -> str:
+    return shutil.which("node") or ""
+
+def _deno_path() -> str:
+    return shutil.which("deno") or ""
 
 # ---------------------------------------------------------------------------
 # OAuth2 Telegram relay
@@ -297,8 +302,15 @@ def build_base_opts(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     Call this every time you build a YoutubeDL instance.
     """
     # Use our custom logger so OAuth2 prompts reach Telegram
-    # Build node.js runtime config for n-challenge solving
-    _node_runtime: Dict[str, Any] = {"path": _NODE_PATH} if _NODE_PATH else {}
+    # Build JS runtime config for n-challenge solving (node + deno)
+    _runtimes: Dict[str, Any] = {}
+    _np = _node_path()
+    if _np:
+        _runtimes["node"] = {"path": _np}
+    _dp = _deno_path()
+    if _dp:
+        _runtimes["deno"] = {"path": _dp}
+    # If neither found, pass empty dict — lets yt-dlp auto-discover
 
     opts: Dict[str, Any] = {
         "quiet": True,
@@ -308,16 +320,20 @@ def build_base_opts(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "fragment_retries": Config.MAX_RETRIES,
         "extractor_retries": Config.MAX_RETRIES,
         "file_access_retries": Config.MAX_RETRIES,
-        # ── Use web client (works with cookies) + node for n-challenge ──
+        # ── YouTube clients: web (needs valid cookies) + fallback clients ──
+        # web = best quality with cookies; ios/android/mweb can return formats
+        # even when web is challenged. yt-dlp tries them in order.
         "extractor_args": {
             "youtube": {
-                "player_client": ["web"],
+                "player_client": ["web", "ios", "android", "mweb"],
+                "player_skip": ["webpage"],
             }
         },
-        # ── JS runtime: use node.js to solve YouTube's n-challenge ──
-        "js_runtimes": {"node": _node_runtime},
+        # ── JS runtime: node/deno to solve YouTube's n-challenge ──
+        "js_runtimes": _runtimes,
         # ── Allow downloading EJS challenge solver script from GitHub ──
         "remote_components": {"ejs:github"},
+        "compat_opts": set(),
         # Avoid DASH manifest fetches that trigger extra auth checks
         "youtube_include_dash_manifest": False,
         # Do NOT let yt-dlp overwrite our cookies file with anonymous cookies
@@ -328,7 +344,6 @@ def build_base_opts(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     po_token = getattr(Config, "PO_TOKEN", "")
     if po_token:
         opts["extractor_args"]["youtube"]["po_token"] = [f"web.gvs+{po_token}"]
-        opts["extractor_args"]["youtube"]["player_client"] = ["web"]
         logger.debug("PO-Token active")
 
     # ── User-Agent override ──
@@ -395,6 +410,13 @@ BOT_DETECTION_MARKERS = [
     "HTTP Error 429",
     "Too Many Requests",
     "This video is unavailable",
+    "Only images are available",
+    "Requested format is not available",
+    "n challenge solving failed",
+    "Some formats may be missing",
+    "challenge solving failed",
+    "use --list-formats",
+    "have a supported JavaScript runtime",
 ]
 
 
