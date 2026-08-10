@@ -1336,6 +1336,28 @@ async def cmd_cookies(client: Client, message: Message):
     _start_cookie_upload(message.chat.id, message.id, prompt.id)
 
 
+@Client.on_message(filters.photo & owner_filter)
+async def on_owner_photo(client: Client, message: Message):
+    """Catch cookie uploads sent as photos — Telegram sometimes converts
+    small .txt files to photos. Guide the owner to send as a document."""
+    # Only intercept if there's a pending cookie request or the caption mentions cookie
+    pending = _pending_cookie_upload(message.chat.id)
+    caption = (message.caption or "").casefold()
+    if pending or "cookie" in caption:
+        await message.reply(
+            "📷 **Photos are not accepted for cookie uploads.**\\n\\n"
+            "Please send the `.txt` file as a **File/Document**:\\n"
+            "1. Tap the 📎 attachment icon\\n"
+            "2. Choose **File** (not Gallery)\\n"
+            "3. Select your `cookies.txt`\\n\\n"
+            "_This ensures the file arrives unchanged._",
+            reply_markup=kb_auth(waiting=bool(pending)),
+        )
+        return
+    # Otherwise let the photo pass through (not a cookie upload attempt)
+    # Note: we don't reply here to avoid interfering with other photo flows
+
+
 @Client.on_message(filters.document & owner_filter)
 async def on_owner_document(client: Client, message: Message):
     """Install owner cookie uploads through one deterministic document route.
@@ -1345,6 +1367,19 @@ async def on_owner_document(client: Client, message: Message):
     a generic document handler from silently swallowing cookies.txt.
     """
     if not _looks_like_cookie_document(message):
+        # Give feedback when a document is silently ignored — otherwise the owner
+        # sees "nothing happened" and has no idea why their upload was rejected.
+        doc = getattr(message, "document", None)
+        if doc:
+            name = (doc.file_name or "").strip()
+            await message.reply(
+                f"📎 **`{md_escape(name)}`** was not recognised as a cookie file.\\n\\n"
+                "To upload cookies:\\n"
+                "1. Run `/cookies` first, then send the `.txt` as a **File/Document**\\n"
+                "2. Or send a file whose name contains `cookie` (e.g. `cookies.txt`)\\n\\n"
+                "_Send the export as a Telegram **File/Document**, not as a photo or pasted text._",
+                reply_markup=kb_auth(waiting=bool(_pending_cookie_upload(message.chat.id))),
+            )
         return
 
     doc = message.document
