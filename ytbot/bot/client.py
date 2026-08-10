@@ -61,8 +61,8 @@ BOT_COMMANDS: List[BotCommand] = [
     BotCommand("diskspace", "Disk usage report"),
     BotCommand("speedtest", "Internet speed test"),
     BotCommand("logs", "Last log lines (optional level/count)"),
-    BotCommand("cookies", "Upload cookies.txt for YouTube auth"),
-    BotCommand("authstatus", "Check YouTube auth state"),
+    BotCommand("cookies", "Open auth panel / upload cookies.txt"),
+    BotCommand("authstatus", "Refresh YouTube auth status"),
     BotCommand("ytdlpupdate", "Update yt-dlp to latest"),
     BotCommand("purge", "Delete last N uploads from dest chat"),
 ]

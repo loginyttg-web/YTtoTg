@@ -12,6 +12,17 @@ load_dotenv()
 
 logger = logging.getLogger("config")
 
+# Resolve runtime paths relative to the application directory, not the shell's
+# current working directory. This keeps ``python ytbot/main.py``, Railway's
+# ``cd ytbot && python main.py`` and test runners consistent.
+APP_DIR = Path(__file__).resolve().parent
+
+
+def _runtime_path(env_name: str, default: str) -> Path:
+    raw = Path(os.getenv(env_name, default)).expanduser()
+    return raw.resolve() if raw.is_absolute() else (APP_DIR / raw).resolve()
+
+
 # ---------------------------------------------------------------------------
 # Quality → yt-dlp format string map
 # ---------------------------------------------------------------------------
@@ -79,8 +90,12 @@ class Config:
     UPLOAD_QUEUE_LIMIT: int = int(os.getenv("UPLOAD_QUEUE_LIMIT", "3"))
 
     # --- Paths ---
-    DOWNLOAD_DIR: Path = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
-    DATA_DIR: Path = Path(os.getenv("DATA_DIR", "./data"))
+    # Relative values are always based at the ytbot/ application directory.
+    # This avoids accidentally creating a second ./data directory when the bot
+    # is launched from the repository root.
+    BASE_DIR: Path = APP_DIR
+    DOWNLOAD_DIR: Path = _runtime_path("DOWNLOAD_DIR", "./downloads")
+    DATA_DIR: Path = _runtime_path("DATA_DIR", "./data")
 
     # --- YouTube Anti-Bot / Authentication ---
     # Path to cookies.txt (Netscape format) — export from browser

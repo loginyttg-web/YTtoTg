@@ -15,9 +15,10 @@ banaiye — apne logged-in browser se export ki hui asli file hi paste/copy kare
 
 1. Bot chat mein `/cookies` bhejein.
 2. `cookies.txt` ko **Document/File** ke roop mein send karein — prompt ko reply
-   kar sakte hain, ya command ke baad same chat mein 15 minutes ke andar direct
-   file send kar sakte hain.
-3. Bot `✅ Cookies Loaded` confirmation bhejega. Phir `/authstatus` chalayein.
+   karna optional hai. Owner clearly named `cookies.txt` ko direct bhi bhej
+   sakta hai, even if the bot restarted after `/cookies`.
+3. Bot pehle `⏳ Cookies received` aur phir `✅ Cookies Loaded` (ya exact error)
+   bhejega. Phir `/authstatus` chalayein.
 
 The file must be a **Netscape-format** cookie export, normally beginning with:
 

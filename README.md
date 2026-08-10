@@ -149,10 +149,11 @@ Required credentials:
 > data/download folders when it starts, and it also detects a manually copied
 > `data/cookies.txt` on the next download — no restart required.
 >
-> **Easiest upload:** send `/cookies` in the bot chat, then either **reply** to
-> its instruction with the exported `cookies.txt` document **or send the file
-> directly in the same chat within 15 minutes**. The bot confirms the saved
-> path and validates the Netscape cookie format before replacing any old file.
+> **Easiest upload:** send `/cookies`, then attach the exported `cookies.txt` as
+> a Telegram **File/Document**. Replying is optional. A clearly named
+> `cookies.txt` is also auto-detected when sent directly—even after the bot has
+> restarted. The bot immediately acknowledges receipt, validates YouTube rows,
+> and atomically replaces the old file only when the new export is valid.
 
 ## 🚂 Deploy on Railway (recommended)
 
@@ -177,9 +178,9 @@ Required credentials:
    | `WATCH_INTERVAL_MIN` | `30` _(auto-watch default)_ |
    | `DEFAULT_QUALITY` | `best` |
 
-4. **Deploy.** After the startup ping arrives, send `/cookies` in the bot chat and
-   reply with your `cookies.txt` **or send it directly within 15 minutes** — it's
-   saved on the volume and survives redeploys.
+4. **Deploy.** After the startup ping arrives, send `/cookies` and attach your
+   `cookies.txt` as a **File/Document** (reply is optional). It is saved on the
+   volume and survives redeploys.
 5. `/watch <channel> <DEST_CHAT_ID>` and you're fully automatic.
 
 The repo ships `railway.json` + `nixpacks.toml` (Python 3.11 + Node.js for
@@ -348,10 +349,15 @@ ytbot/
 **🍪 `/cookies` ke baad file bhejne par kuch nahi hota**
 
 - File **Document/File** ke roop mein send karein, photo ya pasted text ke
-  roop mein nahi. `/cookies` ke baad 15 minutes ke andar direct send karna bhi
-  supported hai; reply karna optional hai.
-- Command sirf `OWNER_ID` use kar sakta hai. Confirmation `✅ Cookies Loaded`
-  aani chahiye; phir `/authstatus` run karein.
+  roop mein nahi. `/cookies` ke baad 15 minutes ke andar direct send supported
+  hai; reply optional hai. `cookies.txt` naam ki file owner seedha bhej sakta
+  hai—even after a restart.
+- Bot pehle `⏳ Cookies received` acknowledgement aur phir `✅ Cookies Loaded`
+  ya exact validation error bhejega. Agar acknowledgement bhi nahi aata, verify
+  karein ki sender ka Telegram ID exactly `OWNER_ID` hai aur bot latest deploy
+  par chal raha hai.
+- Upload command sirf `OWNER_ID` use kar sakta hai. Success ke baad
+  `/authstatus` rows, login markers aur active path dikhata hai.
 - File ka first line normally `# Netscape HTTP Cookie File` hota hai. Chrome
   JSON export ya `.txt` naam wali HTML file valid cookies nahi hoti.
 - Manual local path: `ytbot/data/cookies.txt`. Railway with

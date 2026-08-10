@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
+import shutil
 import time
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, Optional
-
-import shutil
 
 from config import Config
 
@@ -170,84 +171,209 @@ def _check_rate_limit() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def configured_cookie_path() -> Path:
-    """Return the path where a `/cookies` upload should be saved.
+MAX_COOKIE_FILE_BYTES = 5 * 1024 * 1024
+_AUTH_COOKIE_NAMES = {
+    "APISID", "HSID", "LOGIN_INFO", "SAPISID", "SID", "SSID",
+    "__SECURE-1PAPISID", "__SECURE-1PSID", "__SECURE-3PAPISID",
+    "__SECURE-3PSID",
+}
 
-    A configured ``COOKIES_PATH`` wins so an operator can keep the file on a
-    mounted volume.  Otherwise the managed default is ``DATA_DIR/cookies.txt``.
-    ``Path`` is deliberately returned even when the file does not exist yet;
-    the upload handler creates its parent directory before saving.
+
+@dataclass(frozen=True)
+class CookieFileInfo:
+    """Non-sensitive metadata collected while validating a Netscape file."""
+
+    path: Path
+    cookie_count: int
+    youtube_cookie_count: int
+    auth_cookie_count: int
+    expired_cookie_count: int
+    domain_count: int
+    size_bytes: int
+
+    @property
+    def has_login_cookies(self) -> bool:
+        return self.auth_cookie_count > 0
+
+
+def _absolute_cookie_path(raw_path: str) -> Path:
+    """Resolve cookie settings consistently against the ytbot directory."""
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = Config.BASE_DIR / path
+    return path.resolve()
+
+
+def configured_cookie_path() -> Path:
+    """Return the exact path where `/cookies` installs an uploaded file.
+
+    ``COOKIES_PATH`` can be an absolute filename, a relative filename (resolved
+    from ``ytbot/``), or an existing directory. Without it, cookies always live
+    at ``DATA_DIR/cookies.txt``. The path is returned even before it exists.
     """
     configured = (Config.COOKIES_PATH or "").strip()
     if configured:
-        path = Path(configured).expanduser()
-        # Be forgiving when an operator points the setting at an existing
-        # storage directory instead of the full filename.
-        return path / "cookies.txt" if path.is_dir() else path
-    return Config.DATA_DIR / "cookies.txt"
+        path = _absolute_cookie_path(configured)
+        # Be forgiving when an operator supplies an existing storage folder or
+        # explicitly ends the setting in a path separator.
+        is_directory_hint = configured.endswith(("/", "\\"))
+        return path / "cookies.txt" if path.is_dir() or is_directory_hint else path
+    return (Config.DATA_DIR / "cookies.txt").resolve()
+
+
+def inspect_cookies_file(path: Path) -> tuple[Optional[CookieFileInfo], str]:
+    """Parse and validate a Netscape cookies file without exposing values.
+
+    This catches empty exports, HTML/JSON renamed to .txt, malformed rows,
+    unrelated browser exports and oversized uploads before they can replace a
+    known-good file. yt-dlp remains responsible for server-side expiry/auth.
+    """
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            return None, "The cookie file is empty. Export it again from YouTube."
+        if size > MAX_COOKIE_FILE_BYTES:
+            return None, (
+                f"Cookie file is too large ({size:,} bytes). Maximum allowed is "
+                f"{MAX_COOKIE_FILE_BYTES // (1024 * 1024)} MB."
+            )
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        return None, "The file is not UTF-8 text. Export it again as `cookies.txt`."
+    except OSError as exc:
+        return None, f"Could not read the uploaded file: `{exc}`"
+
+    if "\x00" in text:
+        return None, "The uploaded file contains binary data, not browser cookies."
+
+    lines = text.splitlines()
+    first_content_line = next((line.strip() for line in lines if line.strip()), "")
+    valid_headers = ("# Netscape HTTP Cookie File", "# HTTP Cookie File")
+    if not first_content_line.startswith(valid_headers):
+        return (
+            None,
+            "This is not a Netscape-format `cookies.txt` file. "
+            "Export it with **Get cookies.txt LOCALLY** while YouTube is open.",
+        )
+
+    now = int(time.time())
+    cookie_count = 0
+    youtube_count = 0
+    auth_count = 0
+    expired_count = 0
+    domains: set[str] = set()
+
+    for line_number, original_line in enumerate(lines, start=1):
+        line = original_line.strip("\r")
+        if not line or line.startswith("#") and not line.startswith("#HttpOnly_"):
+            continue
+
+        row = line[len("#HttpOnly_"):] if line.startswith("#HttpOnly_") else line
+        columns = row.split("\t", 6)
+        if len(columns) != 7:
+            return None, f"Malformed Netscape cookie row at line `{line_number}`."
+
+        domain, include_subdomains, cookie_path, secure, expires, name, _value = columns
+        if not domain or not cookie_path or include_subdomains.upper() not in {"TRUE", "FALSE"}:
+            return None, f"Invalid cookie fields at line `{line_number}`."
+        if secure.upper() not in {"TRUE", "FALSE"}:
+            return None, f"Invalid secure flag at line `{line_number}`."
+        try:
+            expires_at = int(expires)
+        except ValueError:
+            return None, f"Invalid expiry timestamp at line `{line_number}`."
+
+        clean_domain = domain.lstrip(".").casefold()
+        is_youtube = clean_domain == "youtube.com" or clean_domain.endswith(".youtube.com")
+        cookie_count += 1
+        domains.add(clean_domain)
+        if is_youtube:
+            youtube_count += 1
+            if name.upper() in _AUTH_COOKIE_NAMES:
+                auth_count += 1
+        if expires_at > 0 and expires_at <= now:
+            expired_count += 1
+
+    if cookie_count == 0:
+        return None, "The file has no cookie rows. Export it again from YouTube."
+    if youtube_count == 0:
+        return None, (
+            "No `youtube.com` cookies were found. Open YouTube, stay logged in, "
+            "then export cookies for the current site."
+        )
+
+    return CookieFileInfo(
+        path=path,
+        cookie_count=cookie_count,
+        youtube_cookie_count=youtube_count,
+        auth_cookie_count=auth_count,
+        expired_cookie_count=expired_count,
+        domain_count=len(domains),
+        size_bytes=size,
+    ), ""
+
+
+def validate_cookies_file(path: Path) -> tuple[bool, str]:
+    """Compatibility wrapper used by upload and startup checks."""
+    info, error = inspect_cookies_file(path)
+    return info is not None, error
+
+
+def install_cookies_file(source: Path, destination: Optional[Path] = None) -> CookieFileInfo:
+    """Validate and atomically install *source* with owner-only permissions.
+
+    Raises ``ValueError`` for invalid content and leaves any existing active
+    cookie file untouched. The caller should place the temporary source in the
+    destination directory so ``os.replace`` is atomic on all deployments.
+    """
+    info, error = inspect_cookies_file(source)
+    if info is None:
+        raise ValueError(error)
+
+    target = (destination or configured_cookie_path()).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        source.chmod(0o600)
+    except OSError:
+        # Windows and some mounted filesystems may not support POSIX modes.
+        pass
+    os.replace(source, target)
+    try:
+        target.chmod(0o600)
+    except OSError:
+        pass
+
+    return CookieFileInfo(
+        path=target,
+        cookie_count=info.cookie_count,
+        youtube_cookie_count=info.youtube_cookie_count,
+        auth_cookie_count=info.auth_cookie_count,
+        expired_cookie_count=info.expired_cookie_count,
+        domain_count=info.domain_count,
+        size_bytes=info.size_bytes,
+    )
 
 
 def active_cookie_path() -> Optional[Path]:
-    """Return the currently usable cookies file, if one exists.
+    """Return the first existing *valid* cookie file, checked on every call.
 
-    The default managed location is checked on every call.  This means an
-    operator can manually copy ``data/cookies.txt`` while the bot is already
-    running; the next yt-dlp request sees it without requiring a restart.
-    If a custom ``COOKIES_PATH`` is configured but temporarily missing, the
-    managed default remains a safe fallback.
+    Manual file copies are detected without a restart. Invalid files are never
+    passed to yt-dlp, and a missing/invalid custom path can safely fall back to
+    the managed ``DATA_DIR/cookies.txt`` location.
     """
     configured = (Config.COOKIES_PATH or "").strip()
     candidates: list[Path] = []
     if configured:
         candidates.append(configured_cookie_path())
 
-    default_path = Config.DATA_DIR / "cookies.txt"
+    default_path = (Config.DATA_DIR / "cookies.txt").resolve()
     if not candidates or candidates[0] != default_path:
         candidates.append(default_path)
 
     for path in candidates:
-        if path.is_file():
+        if path.is_file() and inspect_cookies_file(path)[0] is not None:
             return path
     return None
-
-
-def validate_cookies_file(path: Path) -> tuple[bool, str]:
-    """Validate the basic Netscape cookie-file format before replacing auth.
-
-    A failed upload must never overwrite a known-good cookies file.  We keep
-    the check intentionally lightweight: yt-dlp remains the authority on
-    individual cookie values, but the standard header catches HTML exports,
-    screenshots renamed to ``.txt``, and other common mistakes.
-    """
-    try:
-        text = path.read_text(encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        return False, "The file is not UTF-8 text. Export it again as `cookies.txt`."
-    except OSError as exc:
-        return False, f"Could not read the uploaded file: `{exc}`"
-
-    first_content_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
-    valid_headers = ("# Netscape HTTP Cookie File", "# HTTP Cookie File")
-    if not first_content_line.startswith(valid_headers):
-        return (
-            False,
-            "This is not a Netscape-format `cookies.txt` file. "
-            "Export it with the **Get cookies.txt LOCALLY** browser extension.",
-        )
-
-    # The header alone is not useful.  Cookie rows use tab-separated Netscape
-    # columns; requiring one protects an existing file from empty exports.
-    def is_cookie_row(line: str) -> bool:
-        # Mozilla stores HttpOnly rows as `#HttpOnly_<domain>...`; despite the
-        # leading `#`, that is a real Netscape cookie row rather than a comment.
-        row = line[len("#HttpOnly_"):] if line.startswith("#HttpOnly_") else line
-        return bool(row and not row.startswith("#") and len(line.split("\t")) >= 7)
-
-    has_cookie_row = any(is_cookie_row(line) for line in text.splitlines())
-    if not has_cookie_row:
-        return False, "The file has no cookie rows. Please export it again from YouTube."
-
-    return True, ""
 
 
 def _cookie_source() -> Optional[str]:
@@ -268,25 +394,47 @@ def _cookie_source() -> Optional[str]:
 
 
 def auth_status() -> str:
-    """Human-readable auth status for /authstatus display."""
+    """Human-readable, content-aware status for the Telegram auth panel."""
     source = _cookie_source()
     cookie_path = active_cookie_path()
+    target_path = configured_cookie_path()
     po = getattr(Config, "PO_TOKEN", "")
 
-    lines = []
+    lines: list[str] = []
     if source == "cookiefile" and cookie_path:
-        lines.append(f"✅ **Cookies file:** `{cookie_path}`")
+        info, _ = inspect_cookies_file(cookie_path)
+        assert info is not None  # active_cookie_path only returns valid files
+        login_state = "login cookies found" if info.has_login_cookies else "no login marker found"
+        lines.extend([
+            "✅ **YouTube cookies active**",
+            f"├ `{info.youtube_cookie_count}` YouTube rows · `{login_state}`",
+            f"├ `{info.size_bytes:,}` bytes · `{info.expired_cookie_count}` expired rows",
+            f"└ `{cookie_path}`",
+        ])
+        if not info.has_login_cookies:
+            lines.append("⚠️ Re-export while signed in; this file may only contain guest cookies.")
     elif source == "browser":
         lines.append(f"✅ **Browser cookies:** `{Config.COOKIES_FROM_BROWSER}`")
     else:
-        lines.append("⚠️  **No cookies configured**\nRun `/cookies` to upload cookies.txt")
+        invalid_error = ""
+        if target_path.is_file():
+            _info, invalid_error = inspect_cookies_file(target_path)
+        if invalid_error:
+            lines.extend([
+                "❌ **Cookie file found but invalid**",
+                invalid_error,
+                f"📁 Replace: `{target_path}`",
+            ])
+        else:
+            lines.extend([
+                "⚠️ **No YouTube cookies configured**",
+                f"📁 Upload target: `{target_path}`",
+            ])
 
-    if po:
-        lines.append(f"✅ **PO-Token:** set ({len(po)} chars)")
-    else:
-        lines.append("ℹ️  **PO-Token:** not set (optional)")
-
-    lines.append("\nℹ️  OAuth2 is no longer supported by YouTube.")
+    lines.append(
+        f"{'✅' if po else 'ℹ️'} **PO-Token:** "
+        + (f"set (`{len(po)}` chars)" if po else "not set (optional)")
+    )
     return "\n".join(lines)
 
 

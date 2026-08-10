@@ -33,10 +33,10 @@ from core.system import (
     run_speedtest,
 )
 from core.auth import (
+    MAX_COOKIE_FILE_BYTES,
     auth_status,
-    bot_detection_help,
     configured_cookie_path,
-    validate_cookies_file,
+    install_cookies_file,
 )
 from core.downloader import reset_bot_alert, trigger_cancel
 from core.watcher import check_watch
@@ -48,7 +48,7 @@ from utils.logger import tail_log
 from bot.keyboards import (
     kb_sort, kb_quality, kb_processing, kb_confirm, kb_start,
     kb_tasks_page, kb_video, kb_channels,
-    kb_watch_actions, kb_watchlist, kb_users, kb_caption,
+    kb_watch_actions, kb_watchlist, kb_users, kb_caption, kb_auth,
 )
 
 logger = logging.getLogger("handlers")
@@ -178,6 +178,35 @@ START_TEXT = (
     "`/cookies` · `/authstatus` · `/ytdlpupdate`"
 )
 
+def _home_text(role: str) -> str:
+    """Compact control-centre summary; /help keeps the full command list."""
+    counts = state.counts()
+    active = sum(counts.get(key, 0) for key in ACTIVE_STATUSES)
+    watches = state.all_watches()
+    watch_on = sum(1 for watch in watches if watch.enabled)
+    role_label = {
+        ROLE_OWNER: "👑 Owner",
+        ROLE_ADMIN: "🛡 Admin",
+        ROLE_USER: "👤 User",
+    }.get(role, role.title())
+    auth_icon = "✅" if "YouTube cookies active" in auth_status() else "⚠️"
+    paused = bool(state.settings.get("paused", False))
+    engine = "⏸ Paused" if paused else "🟢 Ready"
+    return (
+        "❖ **𝗬𝗧𝘁𝗼𝗧𝗴 · 𝗖𝗼𝗻𝘁𝗿𝗼𝗹 𝗖𝗲𝗻𝘁𝗲𝗿**\n"
+        f"{SEP}\n"
+        f"{engine}   ·   {role_label}\n\n"
+        f"📥 Queue  `{active}` active  ·  `{counts.get('completed', 0)}` done\n"
+        f"👀 Watches  `{watch_on}/{len(watches)}` enabled\n"
+        f"🔐 YouTube auth  {auth_icon}\n"
+        f"🎞 Quality  {quality_label(state.settings.get('quality', 'best'))}\n"
+        f"📍 Destination  `{Config.DEST_CHAT_ID}`\n"
+        f"{SEP}\n"
+        "Send a **YouTube video, playlist or channel link** to begin.\n"
+        "Use the buttons below, or `/help` for every command."
+    )
+
+
 @Client.on_message(filters.command(["start", "help"]))
 async def cmd_start(client: Client, message: Message):
     uid  = message.from_user.id if message.from_user else 0
@@ -192,12 +221,10 @@ async def cmd_start(client: Client, message: Message):
             f"Your user ID: `{uid}`"
         )
         return
-    extra = ""
-    if role == ROLE_USER:
-        extra = f"\n\n👤 Your role: **User** — you can submit links & view status."
-    elif role == ROLE_ADMIN:
-        extra = f"\n\n🛡 Your role: **Admin** — you can manage watches & queue."
-    await message.reply(START_TEXT + extra, reply_markup=kb_start())
+
+    command = ((message.command or [""])[0]).casefold()
+    text = START_TEXT if command == "help" else _home_text(role)
+    await message.reply(text, reply_markup=kb_start())
 
 
 # ---------------------------------------------------------------------------
@@ -1209,11 +1236,12 @@ async def cmd_logs(client: Client, message: Message):
 # /cookies  (owner only)
 # ---------------------------------------------------------------------------
 
-# A direct document upload is allowed for a short window after `/cookies`.
-# Requiring a reply used to be easy to miss in Telegram and made a normal
-# `cookies.txt` upload look as if the bot had ignored it.
+# A direct document upload is allowed for 15 minutes after `/cookies`. A file
+# whose name contains "cookie" is also accepted directly at any time, making
+# uploads survive a bot restart and avoiding fragile handler/filter ordering.
 _COOKIE_UPLOAD_TIMEOUT_SECONDS = 15 * 60
 _cookie_upload_requests: dict[int, tuple[int, int, float]] = {}
+_cookie_install_lock = asyncio.Lock()
 
 
 def _pending_cookie_upload(chat_id: int) -> Optional[tuple[int, int, float]]:
@@ -1225,151 +1253,181 @@ def _pending_cookie_upload(chat_id: int) -> Optional[tuple[int, int, float]]:
     return pending
 
 
-def _is_cookie_upload(message: Message) -> bool:
-    """Accept a document replying to `/cookies`/the prompt, or a pending upload."""
-    if not getattr(message, "document", None):
-        return False
-
-    pending = _pending_cookie_upload(message.chat.id)
-    reply = message.reply_to_message
-
-    # After `/cookies`, the owner may send the file directly (no reply needed)
-    # or reply to either the command or the instruction message.
-    if pending:
-        command_id, prompt_id, _expires_at = pending
-        if reply is None or reply.id in (command_id, prompt_id):
-            return True
-
-    # Keep accepting an explicit reply after a bot restart, when in-memory
-    # pending state is gone but the visible `/cookies` instruction remains.
-    if not reply:
-        return False
-    raw_reply_text = f"{reply.text or ''}\n{reply.caption or ''}"
-    reply_text = raw_reply_text.casefold()
-    return bool(
-        re.search(r"(?m)^/cookies(?:@[a-z0-9_]+)?(?:\s|$)", reply_text)
-        or ("upload" in reply_text and "cookies" in reply_text)
-        # The instruction heading uses Telegram display Unicode, which does
-        # not case-fold to ASCII. Keep an explicit marker for restart safety.
-        or ("𝗨𝗽𝗹𝗼𝗮𝗱" in raw_reply_text and "𝗖𝗼𝗼𝗸𝗶𝗲𝘀" in raw_reply_text)
-    )
-
-
-def cookie_upload_candidate(_filter, _client, message: Message) -> bool:
-    """Pyrogram filter wrapper for a requested cookies document."""
-    return _is_cookie_upload(message)
-
-
-cookie_upload_filter = filters.create(cookie_upload_candidate)
-
-
-@Client.on_message(filters.command("cookies") & owner_filter)
-async def cmd_cookies(client: Client, message: Message):
-    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    cookies_path = configured_cookie_path()
-    cur = auth_status()
-    # Check current cookies quickly
-    has_cookies = "✅" in cur
-    prompt = await message.reply(
-        f"❖ **𝗨𝗽𝗹𝗼𝗮𝗱 𝗖𝗼𝗼𝗸𝗶𝗲𝘀**\n"
-        f"{SEP}\n"
-        f"{cur}\n"
-        f"{SEP}\n"
-        f"**Kaise bhejein:**\n"
-        f"1️⃣ Chrome me **Get cookies.txt LOCALLY** extension install karo\n"
-        f"2️⃣ `youtube.com` par login → extension se **Export** → `cookies.txt` milega\n"
-        f"3️⃣ **Is message ko Reply karke** file ko **Document** ke roop me bhejo\n"
-        f"   _— ya bina reply ke isi chat me 15 min ke andar seedha bhejo_\n\n"
-        f"📁 Save: `{cookies_path}`\n"
-        f"⚠️ Photo / text paste nahi — sirf `.txt` document\n"
-        f"💡 Export ke turant baad bhejo, cookies jaldi expire hote hain!",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔍 /authstatus check", callback_data="noop")],
-            [InlineKeyboardButton("📖 Guide", url="https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp")],
-        ])
-    )
-    _cookie_upload_requests[message.chat.id] = (
-        message.id,
-        prompt.id,
+def _start_cookie_upload(chat_id: int, command_id: int, prompt_id: int) -> None:
+    _cookie_upload_requests[chat_id] = (
+        command_id,
+        prompt_id,
         time.monotonic() + _COOKIE_UPLOAD_TIMEOUT_SECONDS,
     )
 
 
-@Client.on_message(filters.document & owner_filter & cookie_upload_filter)
-async def on_cookies_upload(client: Client, message: Message):
-    """Validate and atomically install a cookies.txt document from the owner."""
-    doc = message.document
-    file_name = (doc.file_name if doc and doc.file_name else "").strip()
-    if not file_name.lower().endswith(".txt"):
-        await message.reply("❌ Please send the exported `cookies.txt` as a `.txt` document.")
+def _cookie_request_reply(message: Message) -> bool:
+    """Recognise replies to an old /cookies command/prompt after a restart."""
+    reply = message.reply_to_message
+    if not reply:
+        return False
+    raw = f"{reply.text or ''}\n{reply.caption or ''}"
+    folded = raw.casefold()
+    return bool(
+        re.search(r"(?m)^/cookies(?:@[a-z0-9_]+)?(?:\s|$)", folded)
+        or ("upload" in folded and "cookie" in folded)
+        or ("𝗨𝗽𝗹𝗼𝗮𝗱" in raw and "𝗖𝗼𝗼𝗸𝗶𝗲𝘀" in raw)
+    )
+
+
+def _looks_like_cookie_document(message: Message) -> bool:
+    """Route requested or clearly named cookie documents to one handler."""
+    doc = getattr(message, "document", None)
+    if not doc:
+        return False
+    if _pending_cookie_upload(message.chat.id) or _cookie_request_reply(message):
+        return True
+    # Owners may send cookies.txt directly without running /cookies first.
+    name = (doc.file_name or "").strip().casefold()
+    return "cookie" in name
+
+
+def _cookie_panel_text(chat_id: int) -> str:
+    pending = _pending_cookie_upload(chat_id)
+    wait_line = ""
+    if pending:
+        minutes = max(1, int((pending[2] - time.monotonic() + 59) // 60))
+        wait_line = f"\n\n🟢 **Upload window open:** `{minutes} min` remaining"
+    return (
+        f"❖ **𝗬𝗼𝘂𝗧𝘂𝗯𝗲 𝗔𝘂𝘁𝗵**\n"
+        f"{SEP}\n"
+        f"{auth_status()}"
+        f"{wait_line}\n"
+        f"{SEP}\n"
+        f"📎 Send the export as a Telegram **File/Document**.\n"
+        f"_Direct `cookies.txt` uploads are auto-detected too._"
+    )
+
+
+@Client.on_message(filters.command("cookies") & owner_filter)
+async def cmd_cookies(client: Client, message: Message):
+    # Open the window before awaiting Telegram so even a very fast upload is
+    # recognised. Update it with the prompt id after the message is sent.
+    _start_cookie_upload(message.chat.id, message.id, 0)
+    prompt = await message.reply(
+        _cookie_panel_text(message.chat.id)
+        + "\n\n"
+        + "**3 quick steps**\n"
+        + "1️⃣ Sign in at `youtube.com` in Chrome/Firefox\n"
+        + "2️⃣ Export **Netscape** format with `Get cookies.txt LOCALLY`\n"
+        + "3️⃣ Send that `.txt` here now — reply is optional",
+        reply_markup=kb_auth(waiting=True),
+    )
+    _start_cookie_upload(message.chat.id, message.id, prompt.id)
+
+
+@Client.on_message(filters.document & owner_filter)
+async def on_owner_document(client: Client, message: Message):
+    """Install owner cookie uploads through one deterministic document route.
+
+    Pyrogram only executes the first matching message handler in a handler
+    group. Keeping detection and installation in this single handler prevents
+    a generic document handler from silently swallowing cookies.txt.
+    """
+    if not _looks_like_cookie_document(message):
         return
 
+    doc = message.document
+    file_name = (doc.file_name if doc and doc.file_name else "").strip()
+    if not file_name.casefold().endswith(".txt"):
+        await message.reply(
+            "❌ **Wrong file type**\n"
+            "Send the Netscape export as a `.txt` **File/Document**, not JSON, ZIP, photo or pasted text.",
+            reply_markup=kb_auth(waiting=True),
+        )
+        return
+
+    file_size = int(getattr(doc, "file_size", 0) or 0)
+    if file_size > MAX_COOKIE_FILE_BYTES:
+        await message.reply(
+            f"❌ Cookie file is too large (`{file_size:,}` bytes). "
+            f"Maximum: `{MAX_COOKIE_FILE_BYTES // (1024 * 1024)} MB`."
+        )
+        return
+
+    progress = await message.reply("⏳ **Cookies received** · downloading and validating…")
     cookies_path = configured_cookie_path()
-    # Download outside the final location.  A broken/HTML file must not erase
-    # a working login cookie file that yt-dlp is currently using.
     cookies_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = cookies_path.with_name(f".{cookies_path.name}.{message.id}.upload")
+    temp_path = cookies_path.with_name(
+        f".{cookies_path.name}.{message.chat.id}.{message.id}.upload"
+    )
     downloaded_path = temp_path
 
     try:
-        downloaded = await client.download_media(message, file_name=str(temp_path))
-        if not downloaded:
-            raise RuntimeError("Telegram did not return a downloaded file path")
-        downloaded_path = Path(downloaded)
+        async with _cookie_install_lock:
+            downloaded = await asyncio.wait_for(
+                client.download_media(message, file_name=str(temp_path)),
+                timeout=120,
+            )
+            if not downloaded:
+                raise RuntimeError("Telegram returned no downloaded file path")
+            downloaded_path = Path(downloaded).resolve()
 
-        valid, error = validate_cookies_file(downloaded_path)
-        if not valid:
-            await message.reply(f"⚠️ **Cookies not changed**\n{error}")
-            logger.warning("Rejected invalid cookies upload from %s: %s", message.chat.id, error)
-            return
-
-        os.replace(downloaded_path, cookies_path)
+            # Validation happens before os.replace, so a bad upload can never
+            # erase the currently working cookies file.
+            info = install_cookies_file(downloaded_path, cookies_path)
+    except asyncio.TimeoutError:
+        logger.warning("Cookie download timed out for chat %s", message.chat.id)
+        await progress.edit(
+            "❌ Cookie download timed out. Check the server connection and send the file again.",
+            reply_markup=kb_auth(waiting=True),
+        )
+        return
+    except ValueError as exc:
+        logger.warning("Rejected invalid cookies upload from %s: %s", message.chat.id, exc)
+        await progress.edit(
+            f"⚠️ **Cookies not changed**\n{exc}\n\n"
+            "Export again while logged into `youtube.com`.",
+            reply_markup=kb_auth(waiting=True),
+        )
+        return
     except Exception as exc:
         logger.exception("Failed to save cookies upload")
-        await message.reply(f"❌ Failed to save cookies file: `{exc}`")
+        await progress.edit(
+            f"❌ **Could not save cookies**\n`{md_escape(short(str(exc), 180))}`\n\n"
+            f"Manual path: `{cookies_path}`",
+            reply_markup=kb_auth(waiting=True),
+        )
         return
     finally:
-        # `os.replace` moves the temporary file, so these are normally absent.
-        # Clean up only temporary names; never touch the active cookie file.
-        for path in (temp_path, downloaded_path):
+        # os.replace moves a successful temp file. Never delete the active path.
+        for path in {temp_path, downloaded_path}:
             if path != cookies_path:
                 try:
                     path.unlink(missing_ok=True)
                 except OSError:
                     pass
 
-    Config.COOKIES_PATH = str(cookies_path)
+    Config.COOKIES_PATH = str(info.path)
     _cookie_upload_requests.pop(message.chat.id, None)
     reset_bot_alert()
 
-    await message.reply(
+    login_line = (
+        f"✅ Login markers: `{info.auth_cookie_count}`"
+        if info.has_login_cookies
+        else "⚠️ No login markers found — re-export while signed in if downloads fail"
+    )
+    await progress.edit(
         f"✅ **𝗖𝗼𝗼𝗸𝗶𝗲𝘀 𝗟𝗼𝗮𝗱𝗲𝗱**\n"
         f"{SEP}\n"
-        f"⋄ Saved at: `{cookies_path}`\n"
-        f"⋄ Size: `{cookies_path.stat().st_size:,}` bytes\n"
-        f"⋄ Run `/authstatus` to verify"
+        f"🍪 YouTube rows: `{info.youtube_cookie_count}`\n"
+        f"{login_line}\n"
+        f"📦 Size: `{info.size_bytes:,}` bytes\n"
+        f"🔒 Permission: `owner-only (0600)`\n"
+        f"📁 `{info.path}`\n\n"
+        f"_The next yt-dlp request uses this file; no restart needed._",
+        reply_markup=kb_auth(waiting=False),
     )
-    logger.info("Cookies uploaded, saved to %s", cookies_path)
+    logger.info(
+        "Cookies installed at %s (%d YouTube rows, %d login markers)",
+        info.path, info.youtube_cookie_count, info.auth_cookie_count,
+    )
 
-
-
-@Client.on_message(filters.document & owner_filter)
-async def on_any_owner_document(client: Client, message: Message):
-    """If owner sends a .txt document outside the cookie window, give a hint."""
-    # If it was already handled as cookie upload, skip
-    if _is_cookie_upload(message):
-        return
-    doc = message.document
-    name = (doc.file_name or "").lower()
-    # Only hint for plausible cookies.txt uploads
-    if "cookie" in name and name.endswith(".txt"):
-        pending = _pending_cookie_upload(message.chat.id)
-        if not pending:
-            await message.reply(
-                f"⚠️ `cookies.txt` mila par koi active request nahi hai\\n"
-                f"Pehele `/cookies` bhejo, phir usi message ko **Reply** karke file bhejo.\\n"
-                f"📁 Path: `{configured_cookie_path()}`"
-            )
 
 # ---------------------------------------------------------------------------
 # /authstatus  &  /ytdlpupdate
@@ -1377,10 +1435,9 @@ async def on_any_owner_document(client: Client, message: Message):
 
 @Client.on_message(filters.command("authstatus") & admin_filter)
 async def cmd_authstatus(client: Client, message: Message):
-    s         = auth_status()
-    help_text = bot_detection_help() if "No auth" in s else ""
     await message.reply(
-        f"❖ **𝗔𝘂𝘁𝗵 𝗦𝘁𝗮𝘁𝘂𝘀**\n{SEP}\n{s}\n\n{help_text}".rstrip()
+        _cookie_panel_text(message.chat.id),
+        reply_markup=kb_auth(waiting=bool(_pending_cookie_upload(message.chat.id))),
     )
 
 
@@ -2092,6 +2149,79 @@ async def on_callback(client: Client, cq: CallbackQuery):
         await cq.answer()
         return
 
+    # ── YouTube auth / cookie controls ──────────────────────────────────
+    if data == "auth_refresh":
+        if not await _cb_require(cq, ROLE_OWNER, ROLE_ADMIN):
+            return
+        waiting = bool(_pending_cookie_upload(chat_id))
+        try:
+            await cq.message.edit(
+                _cookie_panel_text(chat_id),
+                reply_markup=kb_auth(waiting=waiting),
+            )
+        except Exception:
+            pass
+        await cq.answer("Auth status refreshed")
+        return
+
+    if data == "cookie_ready":
+        if not await _cb_require(cq, ROLE_OWNER):
+            return
+        _start_cookie_upload(chat_id, cq.message.id, cq.message.id)
+        try:
+            await cq.message.edit(
+                _cookie_panel_text(chat_id),
+                reply_markup=kb_auth(waiting=True),
+            )
+        except Exception:
+            pass
+        await cq.answer(
+            "Now attach the Netscape .txt as a File/Document. Reply is optional.",
+            show_alert=True,
+        )
+        return
+
+    if data == "cookie_cancel":
+        if not await _cb_require(cq, ROLE_OWNER):
+            return
+        _cookie_upload_requests.pop(chat_id, None)
+        try:
+            await cq.message.edit(
+                _cookie_panel_text(chat_id),
+                reply_markup=kb_auth(waiting=False),
+            )
+        except Exception:
+            pass
+        await cq.answer("Upload cancelled")
+        return
+
+    if data == "auth_manual_path":
+        if not await _cb_require(cq, ROLE_OWNER, ROLE_ADMIN):
+            return
+        await cq.message.reply(
+            "📂 **Manual cookie location**\n"
+            f"`{configured_cookie_path()}`\n\n"
+            "Copy a fresh Netscape `cookies.txt` there. The next download "
+            "detects it automatically — no restart required.\n"
+            "⚠️ Never commit this file to GitHub."
+        )
+        await cq.answer()
+        return
+
+    if data == "cookie_help":
+        if not await _cb_require(cq, ROLE_OWNER, ROLE_ADMIN):
+            return
+        await cq.message.reply(
+            "📖 **Cookie export checklist**\n"
+            "1. Sign in to `youtube.com` in your browser.\n"
+            "2. Use **Get cookies.txt LOCALLY**.\n"
+            "3. Export the current site in **Netscape** format.\n"
+            "4. In Telegram choose 📎 → **File**, then send the `.txt`.\n\n"
+            "JSON, ZIP, screenshots and pasted cookie text are rejected."
+        )
+        await cq.answer()
+        return
+
     # --- Sort ---
     if data.startswith("sort_"):
         if not await _cb_require(cq, ROLE_OWNER, ROLE_ADMIN):
@@ -2429,6 +2559,20 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 await cq.answer(f"🚫 {removed} tasks removed", show_alert=True)
             else:
                 await cq.answer("✖️ Discarded")
+
+        elif action == "auth":
+            if not await _cb_require(cq, ROLE_OWNER, ROLE_ADMIN):
+                return
+            waiting = bool(_pending_cookie_upload(chat_id))
+            await cq.message.reply(
+                _cookie_panel_text(chat_id),
+                reply_markup=kb_auth(waiting=waiting),
+            )
+            await cq.answer("YouTube auth panel")
+
+        elif action == "help":
+            await cq.message.reply(START_TEXT, reply_markup=kb_start())
+            await cq.answer("Command guide")
 
         elif action == "status":
             c = state.counts()
