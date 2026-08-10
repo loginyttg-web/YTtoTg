@@ -3,10 +3,10 @@
 # ffmpeg for merging video+audio and thumbnail conversion.
 
 [phases.setup]
-nixPkgs = ["python311", "python311Packages.pip", "nodejs_20", "ffmpeg"]
+nixPkgs = ["python311", "python311Packages.pip", "nodejs_20", "deno", "ffmpeg"]
 
 [phases.install]
-cmds = ["pip install --break-system-packages -r ytbot/requirements.txt"]
+cmds = ["pip install --break-system-packages --upgrade -r ytbot/requirements.txt", "yt-dlp --js-runtimes node: --remote-components ejs:github --version || true"]
 
 [start]
 cmd = "cd ytbot && python3.11 main.py"
