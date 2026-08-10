@@ -1,7 +1,3 @@
-# Railway / Nixpacks build configuration
-# Python for the bot, Node.js for yt-dlp's YouTube challenge solving,
-# ffmpeg for merging video+audio and thumbnail conversion.
-
 [phases.setup]
 nixPkgs = [
     "python311",
@@ -12,6 +8,3 @@ nixPkgs = [
 
 [phases.install]
 cmds = ["python3 -m pip install -r ytbot/requirements.txt"]
-
-[start]
-cmd = "cd ytbot && python main.py"
