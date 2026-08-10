@@ -45,8 +45,12 @@ state = StateManager(Config.DATA_DIR / "state.json")
 # Daily report scheduler
 # ---------------------------------------------------------------------------
 
+# Prevent duplicate daily reports if scheduler loops quickly after a send
+_last_daily_report_date: str = ""
+
 async def daily_report_scheduler(app) -> None:
-    """Send daily summary to OWNER_ID at configured hour."""
+    """Send daily summary to OWNER_ID at configured hour — exactly once per day."""
+    global _last_daily_report_date
     if not Config.DAILY_REPORT:
         logger.info("Daily report disabled")
         return
@@ -66,13 +70,23 @@ async def daily_report_scheduler(app) -> None:
         logger.info("Next daily report in %.1f hours", wait_seconds / 3600)
 
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=min(wait_seconds, 3600))
+            await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)
         except asyncio.TimeoutError:
             pass
 
         if stop_event.is_set():
             break
 
+        # Double-check we haven't already sent today (survives clock jitter / restarts)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if _last_daily_report_date == today_str:
+            logger.info("Daily report already sent today (%s) — skipping duplicate", today_str)
+            continue
+        # Also check persisted stats date — if stats were just reset today and no activity, skip empty spam
+        if state.stats.get("date") == today_str and state.stats.get("completed", 0) == 0 and state.stats.get("failed", 0) == 0 and state.stats.get("bytes_uploaded", 0) == 0:
+            # Still send once but mark as sent so we don't loop every second if target is in past
+            logger.info("Daily report — no activity today, sending minimal report once")
+        _last_daily_report_date = today_str
         await _send_daily_report(app)
 
 
