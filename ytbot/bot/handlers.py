@@ -105,7 +105,16 @@ YT_PATTERN = r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/(watch\?v=|[a-zA-Z0-
 def yt_url(_, __, msg: Message) -> bool:
     return bool(re.search(YT_PATTERN, msg.text or ""))
 
-yt_filter = filters.create(yt_url)
+def not_a_command(_, __, msg: Message) -> bool:
+    """True when the message does NOT start with a slash command.
+
+    Keeps things like `/watch <url>` or `/cancel <url>` from being treated as
+    raw YouTube links when the sender lacks permission for that command.
+    """
+    text = (msg.text or msg.caption) or ""
+    return not text.lstrip().startswith("/")
+
+yt_filter = filters.create(yt_url) & filters.create(not_a_command)
 
 ACTIVE_STATUSES = ("pending", "downloading", "downloaded", "uploading")
 
@@ -183,18 +192,6 @@ async def cmd_start(client: Client, message: Message):
     elif role == ROLE_ADMIN:
         extra = f"\n\n🛡 Your role: **Admin** — you can manage watches & queue."
     await message.reply(START_TEXT + extra, reply_markup=kb_start())
-
-
-# Catch-all: unregistered users in private chat get a polite nudge
-@Client.on_message(filters.private & filters.text & ~filters.command(["start", "help"]))
-async def on_unregistered(client: Client, message: Message):
-    uid = message.from_user.id if message.from_user else 0
-    if uid and _role_of_user(uid) is None:
-        await message.reply(
-            "🔒 You're not registered with this bot.\n"
-            f"Ask the owner to run `/adduser` (replying to your message).\n\n"
-            f"Your user ID: `{uid}`"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1769,10 +1766,12 @@ def _scan_metadata_caption(
     return "\n".join(lines)
 
 
-@Client.on_message(filters.regex(YT_PATTERN) & user_filter)
+@Client.on_message(filters.regex(YT_PATTERN) & user_filter & filters.create(not_a_command))
 async def on_youtube_url(client: Client, message: Message):
-    url     = message.text.strip().split()[0]
-    kind    = classify_url(url)
+    # Find the actual YouTube URL token (message may contain extra words)
+    tokens = (message.text or "").split()
+    url = next((t for t in tokens if "youtu" in t.lower()), tokens[0] if tokens else "")
+    kind = classify_url(url)
     chat_id = message.chat.id
 
     # ── Deduplication: skip if this chat is already scanning ───────────────
@@ -2568,3 +2567,29 @@ async def on_callback(client: Client, cq: CallbackQuery):
 
     else:
         await cq.answer()
+
+
+# ---------------------------------------------------------------------------
+# Catch-all — MUST stay registered LAST (very end of this file)
+# ---------------------------------------------------------------------------
+# Pyrogram's dispatcher runs the FIRST handler whose filter matches in a group
+# and skips the rest. This catch-all was previously registered right after
+# /start, so it swallowed EVERY private-chat text message that wasn't /start
+# or /help — meaning all commands (and YouTube links) sent to the bot's DM
+# silently did nothing. Handlers here are registered in file order, so this
+# nudge only fires when no other handler claimed the message.
+
+@Client.on_message(
+    filters.private & filters.text
+    & ~filters.command(["start", "help"])
+    & ~user_filter
+)
+async def on_unregistered(client: Client, message: Message):
+    """Unregistered users in private chat get a polite nudge."""
+    uid = message.from_user.id if message.from_user else 0
+    if uid:
+        await message.reply(
+            "🔒 You're not registered with this bot.\n"
+            f"Ask the owner to run `/adduser` (replying to your message).\n\n"
+            f"Your user ID: `{uid}`"
+        )
