@@ -37,8 +37,16 @@ from core.auth import (
     auth_status,
     configured_cookie_path,
     install_cookies_file,
+    is_bot_detection_error,
+    probe_youtube_access,
 )
-from core.downloader import reset_bot_alert, trigger_cancel
+from core.downloader import (
+    clear_youtube_cooldown,
+    register_youtube_block,
+    reset_bot_alert,
+    trigger_cancel,
+    youtube_cooldown_remaining,
+)
 from core.watcher import check_watch
 from utils.helpers import (
     human_bytes, human_time, human_time_short, short, md_escape,
@@ -175,7 +183,7 @@ START_TEXT = (
     "`/serverinfo` · `/diskspace` · `/speedtest`\n"
     "`/logs [n|level]` · `/purge <n>`\n\n"
     "**🔐 Auth**\n"
-    "`/cookies` · `/authstatus` · `/ytdlpupdate`"
+    "`/cookies` · `/authstatus` · `/authcheck` · `/ytdlpupdate`"
 )
 
 def _home_text(role: str) -> str:
@@ -1017,6 +1025,7 @@ async def cmd_watchquality(client: Client, message: Message):
 @Client.on_message(filters.command("watchpause") & admin_filter)
 async def cmd_watchpause(client: Client, message: Message):
     state.settings["watcher_paused"] = True
+    state.settings["watcher_pause_reason"] = "manual"
     state.mark_dirty()
     await message.reply("⏸ **Watcher paused** — no auto-checks until `/watchresume`.")
 
@@ -1024,6 +1033,7 @@ async def cmd_watchpause(client: Client, message: Message):
 @Client.on_message(filters.command("watchresume") & admin_filter)
 async def cmd_watchresume(client: Client, message: Message):
     state.settings["watcher_paused"] = False
+    state.settings.pop("watcher_pause_reason", None)
     state.mark_dirty()
     await message.reply("▶️ **Watcher resumed** — auto-checks are back on.")
 
@@ -1293,14 +1303,19 @@ def _cookie_panel_text(chat_id: int) -> str:
     if pending:
         minutes = max(1, int((pending[2] - time.monotonic() + 59) // 60))
         wait_line = f"\n\n🟢 **Upload window open:** `{minutes} min` remaining"
+    cooldown = youtube_cooldown_remaining()
+    cooldown_line = (
+        f"\n🛑 **YouTube cooldown:** `{human_time_short(cooldown)}` remaining"
+        if cooldown else ""
+    )
     return (
         f"❖ **𝗬𝗼𝘂𝗧𝘂𝗯𝗲 𝗔𝘂𝘁𝗵**\n"
         f"{SEP}\n"
         f"{auth_status()}"
-        f"{wait_line}\n"
+        f"{wait_line}{cooldown_line}\n"
         f"{SEP}\n"
         f"📎 Send the export as a Telegram **File/Document**.\n"
-        f"_Direct `cookies.txt` uploads are auto-detected too._"
+        f"_File Status is structural; use 🌐 Live Check to test Railway → YouTube._"
     )
 
 
@@ -1407,6 +1422,27 @@ async def on_owner_document(client: Client, message: Message):
     _cookie_upload_requests.pop(message.chat.id, None)
     reset_bot_alert()
 
+    # Recover tasks failed by older deployments, but do not immediately unleash
+    # parallel workers into an IP that may still be returning 429. A successful
+    # Live Check below clears the cooldown and resumes auth-paused components.
+    recovered = 0
+    awaiting_live_check = False
+    if state is not None:
+        recovered = state.retry_failed_matching((
+            "bot detection",
+            "http error 429",
+            "too many requests",
+            "only images are available",
+        ))
+        if state.settings.get("pause_reason") == "youtube_auth" or recovered > 0:
+            state.settings["paused"] = True
+            state.settings["pause_reason"] = "youtube_auth"
+            awaiting_live_check = True
+        if state.settings.get("watcher_pause_reason") == "youtube_auth":
+            awaiting_live_check = True
+        if recovered or awaiting_live_check:
+            state.mark_dirty()
+
     login_line = (
         f"✅ Login markers: `{info.auth_cookie_count}`"
         if info.has_login_cookies
@@ -1419,8 +1455,10 @@ async def on_owner_document(client: Client, message: Message):
         f"{login_line}\n"
         f"📦 Size: `{info.size_bytes:,}` bytes\n"
         f"🔒 Permission: `owner-only (0600)`\n"
-        f"📁 `{info.path}`\n\n"
-        f"_The next yt-dlp request uses this file; no restart needed._",
+        f"📁 `{info.path}`\n"
+        + (f"🔁 Re-queued old auth failures: `{recovered}`\n" if recovered else "")
+        + ("⏸ Queue is safe—run 🌐 Live Check before resume\n" if awaiting_live_check else "")
+        + "\n_The next yt-dlp request uses this file; no restart needed._",
         reply_markup=kb_auth(waiting=False),
     )
     logger.info(
@@ -1439,6 +1477,48 @@ async def cmd_authstatus(client: Client, message: Message):
         _cookie_panel_text(message.chat.id),
         reply_markup=kb_auth(waiting=bool(_pending_cookie_upload(message.chat.id))),
     )
+
+
+async def _run_auth_live_check(message: Message) -> None:
+    wait = await message.reply("🌐 **Live auth check** · contacting YouTube once…")
+    try:
+        ok, detail = await asyncio.wait_for(
+            asyncio.to_thread(probe_youtube_access),
+            timeout=45,
+        )
+    except asyncio.TimeoutError:
+        ok, detail = False, "YouTube did not respond within 45 seconds."
+
+    if ok:
+        clear_youtube_cooldown()
+        resumed = False
+        if state is not None:
+            if state.settings.get("pause_reason") == "youtube_auth":
+                state.settings["paused"] = False
+                state.settings.pop("pause_reason", None)
+                resumed = True
+            if state.settings.get("watcher_pause_reason") == "youtube_auth":
+                state.settings["watcher_paused"] = False
+                state.settings.pop("watcher_pause_reason", None)
+                resumed = True
+            if resumed:
+                state.mark_dirty()
+        await wait.edit(
+            f"✅ **Live YouTube check passed**\n{detail}\n\n"
+            "Railway can currently see playable media formats."
+            + ("\n▶️ Auth-paused queue/watcher resumed automatically." if resumed else "")
+        )
+    else:
+        await wait.edit(
+            f"❌ **Live YouTube check failed**\n{detail}\n\n"
+            "Upload fresh `/cookies`. For HTTP 429, also wait 30–60 minutes "
+            "before retrying; repeatedly pressing resume makes the block longer."
+        )
+
+
+@Client.on_message(filters.command("authcheck") & admin_filter)
+async def cmd_authcheck(client: Client, message: Message):
+    await _run_auth_live_check(message)
 
 
 @Client.on_message(filters.command("ytdlpupdate") & owner_filter)
@@ -1514,6 +1594,7 @@ async def cmd_resetqueue(client: Client, message: Message):
 @Client.on_message(filters.command("pause") & admin_filter)
 async def cmd_pause(client: Client, message: Message):
     state.settings["paused"] = True
+    state.settings["pause_reason"] = "manual"
     state.mark_dirty()
     await message.reply(
         "⏸ **Paused.**\nDownloads & uploads on hold — `/resume` to continue.",
@@ -1523,7 +1604,20 @@ async def cmd_pause(client: Client, message: Message):
 
 @Client.on_message(filters.command("resume") & admin_filter)
 async def cmd_resume(client: Client, message: Message):
+    force = len(message.command or []) > 1 and message.command[1].casefold() == "force"
+    cooldown = youtube_cooldown_remaining()
+    if cooldown > 0 and not force:
+        await message.reply(
+            "🛑 **YouTube cooldown is still active**\n"
+            f"Remaining: `{human_time_short(cooldown)}`\n\n"
+            "Upload fresh `/cookies` to clear it, or wait before resuming. "
+            "If you have fixed auth manually, use `/resume force`."
+        )
+        return
+    if force:
+        clear_youtube_cooldown()
     state.settings["paused"] = False
+    state.settings.pop("pause_reason", None)
     state.mark_dirty()
     await message.reply(
         "▶️ **Resumed.** Back to work!",
@@ -1960,6 +2054,24 @@ async def on_youtube_url(client: Client, message: Message):
         _scan_in_flight[chat_id] = False
 
 
+async def _show_scan_error(status_msg: Message, exc: Exception) -> None:
+    """Show an actionable auth error and globally pause on explicit blocks."""
+    error = str(exc)
+    if is_bot_detection_error(error):
+        cooldown = register_youtube_block()
+        state.settings["paused"] = True
+        state.settings["pause_reason"] = "youtube_auth"
+        state.mark_dirty()
+        await status_msg.edit(
+            "🛑 **YouTube blocked this scan**\n"
+            f"Cooldown: `{human_time_short(cooldown)}`\n\n"
+            "Nothing was queued. Upload fresh `/cookies`, then run `/authcheck`. "
+            "For HTTP 429, wait 30–60 minutes instead of repeatedly retrying."
+        )
+        return
+    await status_msg.edit(f"❌ Scan failed: `{md_escape(short(error, 300))}`")
+
+
 async def _handle_video(client: Client, message: Message, url: str):
     """Single video: fetch info, show quality selector, then add to queue on Start."""
     vid = parse_video_id(url)
@@ -1972,7 +2084,7 @@ async def _handle_video(client: Client, message: Message, url: str):
     try:
         result = await scan(url)
     except Exception as exc:
-        await status_msg.edit(f"❌ Scan failed: `{exc}`")
+        await _show_scan_error(status_msg, exc)
         return
 
     if not result["items"]:
@@ -2042,7 +2154,7 @@ async def _handle_scan(client: Client, message: Message, url: str, kind: str):
     try:
         result = await scan(url)
     except Exception as exc:
-        await status_msg.edit(f"❌ Scan failed: `{exc}`")
+        await _show_scan_error(status_msg, exc)
         return
 
     items   = result["items"]
@@ -2150,6 +2262,13 @@ async def on_callback(client: Client, cq: CallbackQuery):
         return
 
     # ── YouTube auth / cookie controls ──────────────────────────────────
+    if data == "auth_live_check":
+        if not await _cb_require(cq, ROLE_OWNER, ROLE_ADMIN):
+            return
+        await cq.answer("Contacting YouTube…")
+        await _run_auth_live_check(cq.message)
+        return
+
     if data == "auth_refresh":
         if not await _cb_require(cq, ROLE_OWNER, ROLE_ADMIN):
             return
@@ -2516,6 +2635,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
             if not await _cb_require(cq, ROLE_OWNER, ROLE_ADMIN):
                 return
             state.settings["paused"] = True
+            state.settings["pause_reason"] = "manual"
             state.mark_dirty()
             await cq.answer("⏸ Paused")
             await _refresh_dashboard_msg(cq)
@@ -2523,7 +2643,15 @@ async def on_callback(client: Client, cq: CallbackQuery):
         elif action == "resume":
             if not await _cb_require(cq, ROLE_OWNER, ROLE_ADMIN):
                 return
+            cooldown = youtube_cooldown_remaining()
+            if cooldown > 0:
+                await cq.answer(
+                    f"YouTube cooldown: {human_time_short(cooldown)} left. Upload fresh cookies.",
+                    show_alert=True,
+                )
+                return
             state.settings["paused"] = False
+            state.settings.pop("pause_reason", None)
             state.mark_dirty()
             await cq.answer("▶️ Resumed")
             await _refresh_dashboard_msg(cq)

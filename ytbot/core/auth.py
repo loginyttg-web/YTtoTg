@@ -75,14 +75,33 @@ _OAUTH_KEYWORDS = (
 
 
 class OAuthTelegramLogger:
+    """yt-dlp logger with a small per-request diagnostic buffer.
+
+    yt-dlp often emits the useful cause (for example HTTP 429 or "only images
+    are available") as a warning, then raises only the generic "requested
+    format is not available" exception. Keeping warnings lets the downloader
+    classify the real failure instead of treating every format error as auth.
     """
-    Drop-in yt-dlp logger that forwards OAuth2 device-auth messages to the
-    bot owner on Telegram while keeping everything else in the normal log.
-    """
+
+    def __init__(self) -> None:
+        self._diagnostics: list[str] = []
+        self._diagnostic_lock = threading.Lock()
 
     def _is_oauth_msg(self, msg: str) -> bool:
         low = msg.lower()
         return any(kw in low for kw in _OAUTH_KEYWORDS)
+
+    def _remember(self, msg: str) -> None:
+        clean = " ".join(str(msg).strip().split())[:600]
+        if not clean:
+            return
+        with self._diagnostic_lock:
+            self._diagnostics.append(clean)
+            del self._diagnostics[:-12]
+
+    def diagnostic_context(self) -> str:
+        with self._diagnostic_lock:
+            return " | ".join(self._diagnostics)
 
     def debug(self, msg: str) -> None:
         if self._is_oauth_msg(msg):
@@ -107,9 +126,11 @@ class OAuthTelegramLogger:
             logger.info("[yt-dlp] %s", msg.strip())
 
     def warning(self, msg: str) -> None:
+        self._remember(msg)
         logger.warning("[yt-dlp] %s", msg.strip())
 
     def error(self, msg: str) -> None:
+        self._remember(msg)
         logger.error("[yt-dlp] %s", msg.strip())
 
 
@@ -468,15 +489,10 @@ def build_base_opts(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "fragment_retries": Config.MAX_RETRIES,
         "extractor_retries": Config.MAX_RETRIES,
         "file_access_retries": Config.MAX_RETRIES,
-        # ── YouTube clients: web (needs valid cookies) + fallback clients ──
-        # web = best quality with cookies; ios/android/mweb can return formats
-        # even when web is challenged. yt-dlp tries them in order.
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web", "ios", "android", "mweb"],
-                "player_skip": ["webpage"],
-            }
-        },
+        # Let the installed yt-dlp choose its current supported YouTube client.
+        # Hard-coding web+ios+android+mweb caused four client attempts per video
+        # and amplified Railway HTTP 429 blocks as YouTube changed clients.
+        "extractor_args": {"youtube": {}},
         # ── JS runtime: node/deno to solve YouTube's n-challenge ──
         "js_runtimes": _runtimes,
         # ── Allow downloading EJS challenge solver script from GitHub ──
@@ -550,28 +566,114 @@ def apply_request_throttle() -> bool:
 # Handle the specific bot-detection error
 # ---------------------------------------------------------------------------
 
-BOT_DETECTION_MARKERS = [
+RATE_LIMIT_MARKERS = (
+    "HTTP Error 429",
+    "Too Many Requests",
+    "status code 429",
+)
+
+HARD_BLOCK_MARKERS = (
     "Sign in to confirm you",
     "not a robot",
     "Sign in to prove",
     "confirm you're not a bot",
-    "HTTP Error 429",
-    "Too Many Requests",
-    "This video is unavailable",
     "Only images are available",
-    "Requested format is not available",
+)
+
+BOT_DETECTION_MARKERS = HARD_BLOCK_MARKERS + (
     "n challenge solving failed",
     "Some formats may be missing",
     "challenge solving failed",
-    "use --list-formats",
     "have a supported JavaScript runtime",
-]
+)
+
+FORMAT_UNAVAILABLE_MARKERS = (
+    "Requested format is not available",
+    "use --list-formats",
+)
+
+
+def _has_marker(error_msg: str, markers) -> bool:
+    lower = error_msg.casefold()
+    return any(marker.casefold() in lower for marker in markers)
+
+
+def is_rate_limit_error(error_msg: str) -> bool:
+    """Return True only for an explicit YouTube HTTP 429 response."""
+    return _has_marker(error_msg, RATE_LIMIT_MARKERS)
+
+
+def is_hard_youtube_block(error_msg: str) -> bool:
+    """Return True when an extraction should not continue with partial data."""
+    return is_rate_limit_error(error_msg) or _has_marker(error_msg, HARD_BLOCK_MARKERS)
 
 
 def is_bot_detection_error(error_msg: str) -> bool:
-    """Return True if the error is specifically a bot-detection block."""
-    lower = error_msg.lower()
-    return any(marker.lower() in lower for marker in BOT_DETECTION_MARKERS)
+    """Return True for explicit 429/challenge evidence, not generic formats.
+
+    A private/deleted video can legitimately produce "requested format is not
+    available". Pausing the entire queue for that generic message was a false
+    positive; the downloader now includes yt-dlp warning context so real 429 or
+    "only images" failures remain detectable.
+    """
+    return is_rate_limit_error(error_msg) or _has_marker(error_msg, BOT_DETECTION_MARKERS)
+
+
+def is_format_unavailable_error(error_msg: str) -> bool:
+    return _has_marker(error_msg, FORMAT_UNAVAILABLE_MARKERS)
+
+
+def probe_youtube_access() -> tuple[bool, str]:
+    """Perform one explicit live extraction to verify Railway → YouTube access.
+
+    This is intentionally called only from `/authcheck` or its UI button; normal
+    `/authstatus` remains a zero-network structural check.
+    """
+    if active_cookie_path() is None and not Config.COOKIES_FROM_BROWSER:
+        return False, "No valid cookies file is active. Upload `/cookies` first."
+
+    opts: Dict[str, Any] = {}
+    try:
+        import yt_dlp
+
+        apply_request_throttle()
+        opts = build_base_opts({
+            "skip_download": True,
+            "noplaylist": True,
+            "socket_timeout": 15,
+            "retries": 0,
+            "fragment_retries": 0,
+            "extractor_retries": 0,
+            "file_access_retries": 0,
+        })
+        # Stable public test video. We only read metadata/formats; no media is
+        # downloaded and no private account details are returned.
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                download=False,
+            )
+        formats = info.get("formats") or []
+        playable = [
+            fmt for fmt in formats
+            if fmt.get("vcodec") not in (None, "none")
+            or fmt.get("acodec") not in (None, "none")
+        ]
+        if not playable:
+            return False, "YouTube responded, but exposed no playable audio/video formats."
+        return True, f"YouTube returned `{len(playable)}` playable formats."
+    except Exception as exc:
+        error = str(exc)
+        ydl_logger = opts.get("logger")
+        if hasattr(ydl_logger, "diagnostic_context"):
+            diagnostics = ydl_logger.diagnostic_context()
+            if diagnostics:
+                error = f"{error} | {diagnostics}"
+        if is_rate_limit_error(error):
+            return False, "Railway's current IP is rate-limited by YouTube (HTTP 429)."
+        if is_bot_detection_error(error):
+            return False, "YouTube bot/challenge protection is still blocking this server."
+        return False, f"Live extraction failed: {error[:240]}"
 
 
 def bot_detection_help() -> str:
@@ -581,10 +683,11 @@ def bot_detection_help() -> str:
         return (
             "🛡️ **Bot detection triggered despite auth.**\n\n"
             "Possible fixes:\n"
-            "1. Your cookies may have expired — re-export `cookies.txt` and upload with `/cookies`\n"
-            "2. Try reducing speed: `/setparallel 1` + increase `SLEEP_INTERVAL` env var\n"
-            "3. Your account may be flagged — try a different Google account\n"
-            "4. Wait 30-60 min before running `/resume`"
+            "1. Re-export fresh `cookies.txt` while logged into YouTube and upload with `/cookies`\n"
+            "2. Run `/authcheck` (or 🌐 Live Check) before resuming the queue\n"
+            "3. Use `/setparallel 1` and increase `SLEEP_INTERVAL` to reduce requests\n"
+            "4. For HTTP 429, wait 30–60 min; repeated retries extend the block\n"
+            "5. If cookies are valid but 429 persists, Railway's shared IP is rate-limited"
         )
     return (
         "🛡️ **YouTube bot detection triggered.**\n\n"

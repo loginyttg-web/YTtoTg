@@ -20,12 +20,18 @@ sys.path.insert(0, str(ROOT / "ytbot"))
 
 from config import Config  # noqa: E402
 from core.auth import (  # noqa: E402
+    OAuthTelegramLogger,
     active_cookie_path,
     configured_cookie_path,
     inspect_cookies_file,
     install_cookies_file,
+    is_bot_detection_error,
+    is_format_unavailable_error,
+    is_hard_youtube_block,
+    is_rate_limit_error,
     validate_cookies_file,
 )
+from core.state import FAILED, PENDING, StateManager, Task  # noqa: E402
 
 
 def netscape_cookie(
@@ -131,6 +137,52 @@ class CookieValidationTests(unittest.TestCase):
             configured_cookie_path(),
             (self.root / "private/youtube-cookies.txt").resolve(),
         )
+
+
+class YouTubeErrorClassificationTests(unittest.TestCase):
+    def test_generic_format_error_does_not_pause_the_whole_queue(self) -> None:
+        error = "Requested format is not available. Use --list-formats"
+        self.assertTrue(is_format_unavailable_error(error))
+        self.assertFalse(is_bot_detection_error(error))
+
+    def test_429_and_only_images_are_auth_block_evidence(self) -> None:
+        self.assertTrue(is_rate_limit_error("HTTP Error 429: Too Many Requests"))
+        self.assertTrue(is_hard_youtube_block("HTTP Error 429: Too Many Requests"))
+        self.assertTrue(is_bot_detection_error("HTTP Error 429: Too Many Requests"))
+        self.assertTrue(is_hard_youtube_block("Only images are available for download"))
+        self.assertTrue(is_bot_detection_error("Only images are available for download"))
+
+    def test_yt_dlp_warning_context_is_retained(self) -> None:
+        logger = OAuthTelegramLogger()
+        logger.warning("Unable to download webpage: HTTP Error 429: Too Many Requests")
+        logger.error("Requested format is not available")
+        context = logger.diagnostic_context()
+        self.assertIn("HTTP Error 429", context)
+        self.assertIn("Requested format", context)
+
+
+class AuthFailureRecoveryTests(unittest.TestCase):
+    def test_only_matching_old_auth_failures_are_requeued(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateManager(Path(tmp) / "state.json")
+            state.tasks = {
+                "auth": Task(
+                    id="auth",
+                    url="https://youtu.be/aaaaaaaaaaa",
+                    status=FAILED,
+                    error="Bot detection: HTTP Error 429",
+                ),
+                "deleted": Task(
+                    id="deleted",
+                    url="https://youtu.be/bbbbbbbbbbb",
+                    status=FAILED,
+                    error="Video unavailable: uploader deleted this video",
+                ),
+            }
+            recovered = state.retry_failed_matching(("bot detection", "http error 429"))
+            self.assertEqual(recovered, 1)
+            self.assertEqual(state.tasks["auth"].status, PENDING)
+            self.assertEqual(state.tasks["deleted"].status, FAILED)
 
 
 class RuntimePathTests(unittest.TestCase):

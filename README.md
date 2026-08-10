@@ -287,8 +287,9 @@ flood cooldown is shared across all workers.
 ### 🔐 Auth
 | Command | Description |
 |---|---|
-| `/cookies` | Upload `cookies.txt` |
-| `/authstatus` | Check current auth state |
+| `/cookies` | Upload/replace `cookies.txt` and recover auth-failed tasks |
+| `/authstatus` | Check local cookie file structure/path (no network request) |
+| `/authcheck` | Live-test Railway → YouTube and confirm playable formats |
 | `/ytdlpupdate` | Update yt-dlp to the latest version |
 
 ---
@@ -362,6 +363,24 @@ ytbot/
   JSON export ya `.txt` naam wali HTML file valid cookies nahi hoti.
 - Manual local path: `ytbot/data/cookies.txt`. Railway with
   `DATA_DIR=/data/ytdata`: `/data/ytdata/cookies.txt`.
+
+**🛑 Railway logs show `HTTP Error 429`, `Only images are available`, or
+`Requested format is not available`**
+
+- `429` is a YouTube rate limit on Railway's outbound IP; changing 720p/1080p
+  does not fix it. `Only images` followed by `Requested format` means YouTube
+  did not expose media streams—it is normally auth/challenge related, not a
+  missing quality.
+- Upload a freshly exported file with `/cookies`, then run `/authcheck`.
+  `/authstatus` only validates the local file; `/authcheck` performs one real
+  YouTube extraction and confirms playable formats.
+- On a detected challenge the bot pauses globally for 30 minutes and keeps
+  affected tasks **pending** instead of failing them. Fresh `/cookies` re-queues
+  old auth failures; a successful `/authcheck` then clears the cooldown and
+  safely resumes the auth-paused queue/watcher.
+- Do not repeatedly press Resume during 429. Wait 30–60 minutes, set
+  `PARALLEL_DOWNLOADS=1`, and use `SLEEP_INTERVAL=10` / `MAX_SLEEP_INTERVAL=20`
+  if the Railway IP remains limited.
 
 **⬇️ Downloads fail / nothing gets queued**
 

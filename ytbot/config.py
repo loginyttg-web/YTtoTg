@@ -112,6 +112,9 @@ class Config:
     MAX_SLEEP_INTERVAL: float = float(os.getenv("MAX_SLEEP_INTERVAL", "8"))
     # Rate limit: max downloads per hour (0 = unlimited)
     RATE_LIMIT: int = int(os.getenv("RATE_LIMIT", "0"))
+    # Global cooldown after YouTube returns 429 / bot challenge. A successful
+    # live auth check clears it early; workers wait instead of hammering.
+    YOUTUBE_COOLDOWN_MINUTES: int = int(os.getenv("YOUTUBE_COOLDOWN_MINUTES", "30"))
     # Custom User-Agent override (leave empty for yt-dlp default)
     USER_AGENT: str = os.getenv("USER_AGENT", "")
 
@@ -188,6 +191,8 @@ class Config:
             errors.append("PROGRESS_INTERVAL must be <= 15")
         if cls.MAX_RETRIES < 0:
             errors.append("MAX_RETRIES must be >= 0")
+        if cls.YOUTUBE_COOLDOWN_MINUTES < 5 or cls.YOUTUBE_COOLDOWN_MINUTES > 180:
+            errors.append("YOUTUBE_COOLDOWN_MINUTES must be between 5 and 180")
         if cls.WATCH_INTERVAL_MIN < 5 or cls.WATCH_INTERVAL_MIN > 1440:
             errors.append("WATCH_INTERVAL_MIN must be between 5 and 1440")
 

@@ -146,9 +146,10 @@ def kb_start() -> InlineKeyboardMarkup:
 def kb_auth(waiting: bool = False) -> InlineKeyboardMarkup:
     """YouTube authentication panel with actionable controls."""
     rows = [
+        [InlineKeyboardButton("📎 Upload / Replace Cookies", callback_data="cookie_ready")],
         [
-            InlineKeyboardButton("📎 Upload / Replace", callback_data="cookie_ready"),
-            InlineKeyboardButton("↻ Refresh", callback_data="auth_refresh"),
+            InlineKeyboardButton("🌐 Live Check", callback_data="auth_live_check"),
+            InlineKeyboardButton("↻ File Status", callback_data="auth_refresh"),
         ],
         [
             InlineKeyboardButton("📂 Manual Path", callback_data="auth_manual_path"),

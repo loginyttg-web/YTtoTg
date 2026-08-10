@@ -25,7 +25,11 @@ from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import Message
 
 from config import Config
-from core.downloader import progress_registry, _registry_lock
+from core.downloader import (
+    progress_registry,
+    youtube_cooldown_remaining,
+    _registry_lock,
+)
 from core.uploader import upload_progress, _uplock
 from core.state import StateManager, DOWNLOADED
 from core.system import disk_usage, is_disk_alert
@@ -234,6 +238,11 @@ def format_dashboard(state: StateManager) -> str:
 
     # ── Alerts (outside the box) ────────────────────────────────────────────
     alerts: list[str] = []
+    cooldown = youtube_cooldown_remaining()
+    if cooldown > 0:
+        alerts.append(
+            f"🛑 YouTube cooldown {human_time_short(cooldown)} — /cookies → /authcheck"
+        )
     if is_disk_alert():
         alerts.append(f"⚠️ Disk {du['percent']:.0f}% full — free space or run /clear")
     if failed > 0 and dl_count == 0 and up_count == 0 and pending == 0:
