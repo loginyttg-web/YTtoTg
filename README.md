@@ -136,6 +136,19 @@ Required credentials:
 > 🍪 **Recommended:** upload YouTube cookies with the `/cookies` command to avoid
 > YouTube's "Sign in to confirm you're not a robot" wall.
 
+#### 📁 Where does `cookies.txt` go?
+
+| Where you run it | Cookies file location |
+|---|---|
+| Local (default) | `ytbot/data/cookies.txt` — create the `data/` folder yourself if needed, or just start the bot once and it creates it automatically |
+| Railway (volume at `/data`) | `/data/ytdata/cookies.txt` |
+| Anywhere | Set `COOKIES_PATH=/full/path/cookies.txt` in `.env` to use any location |
+
+> The `data/` folder is **git-ignored** — that's why you don't see it in the
+> repo. The bot creates it (plus `downloads/`) automatically on first start.
+> Easiest way to load cookies: send `/cookies` in the bot chat, then reply to
+> the bot's message with your exported `cookies.txt` file — no folder needed.
+
 ## 🚂 Deploy on Railway (recommended)
 
 1. **Push this repo to GitHub** (already done) → [railway.app](https://railway.app) →
@@ -297,6 +310,37 @@ ytbot/
     ├── helpers.py        # bars, formatters, URL parsing
     └── logger.py         # rotating logs + /logs tail
 ```
+
+---
+
+## 🛠 Troubleshooting
+
+**🤖 Commands give no response (bot's DM)**
+
+1. Make sure the bot is actually running — `python main.py` should print
+   `🤖 Bot started!` and send a startup ping that deletes itself after 10 s.
+2. Only the **owner** (`OWNER_ID`) can use commands by default. Everyone else
+   must be added with `/adduser` (reply to their message). Send `/start` to see
+   your role.
+3. Bot running but silent? Run `/logs 50` in a group where you're admin, or
+   check `ytbot/data/bot.log` on the server — handler errors are logged there.
+4. ⚠️ Old versions of this repo had a handler-order bug where a "not
+   registered" catch-all was registered too early and silently swallowed every
+   private-chat command (only `/start` and `/help` responded). This is fixed —
+   **pull the latest code and restart**.
+
+**🍪 YouTube says "Sign in to confirm you're not a robot"**
+
+1. Install the *Get cookies.txt LOCALLY* browser extension.
+2. Log in to YouTube, export `cookies.txt`, then either:
+   - send `/cookies` in the bot chat and **reply with the file**, or
+   - put the file at `ytbot/data/cookies.txt` (see table above) and restart.
+3. Check with `/authstatus`.
+
+**⬇️ Downloads fail / nothing gets queued**
+
+- `/logs 100 error` shows the last errors. Common causes: expired cookies,
+  missing `ffmpeg` on the server, or disk full (`/diskspace`).
 
 ---
 
