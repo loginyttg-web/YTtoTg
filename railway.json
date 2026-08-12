@@ -5,7 +5,7 @@
     "buildCommand": "pip install --break-system-packages -r ytbot/requirements.txt"
   },
   "deploy": {
-    "startCommand": "cd ytbot && python3.11 main.py",
+    "startCommand": "python3.11 ytbot/main.py",
     "restartPolicyType": "ALWAYS"
   }
 }
