@@ -158,7 +158,6 @@ async def _measure_ping(session) -> str:
 async def run_speedtest() -> str:
     """Full speedtest: ping + 200 MB download (≥10s) + 200 MB upload."""
     import aiohttp
-    import asyncio
 
     logger.info("Running full speedtest (200MB DL + 200MB UL + ping)...")
     total_start = time.monotonic()

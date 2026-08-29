@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import Config, quality_format
+from config import Config
 
 logger = logging.getLogger("state")
 
@@ -491,7 +491,6 @@ class StateManager:
             t = self.tasks.get(video_id)
             if not t:
                 return False
-            old_status = t.status
             t.status = status
             for k, v in kwargs.items():
                 if hasattr(t, k):
@@ -696,7 +695,10 @@ class StateManager:
             target = local.replace(hour=hh, minute=mm, second=0, microsecond=0)
             if local < target:
                 target -= timedelta(days=1)   # most recent occurrence
-            return watch.last_check < target.timestamp()
+            # 60 s grace: a catch-up scan that ran just before HH:MM (e.g. the
+            # bot started at 05:59 for a 06:00 watch) must not re-trigger the
+            # moment HH:MM passes — that produced a double scan in one day.
+            return watch.last_check < target.timestamp() - 60
 
         return (now - watch.last_check) >= self.watch_interval(watch) * 60
 

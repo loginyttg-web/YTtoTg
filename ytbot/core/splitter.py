@@ -48,10 +48,19 @@ def split_to_zip_parts(filepath: str) -> List[str]:
         with open(filepath, "rb") as src:
             for i in range(total_chunks):
                 part_path = str(filepath) + f".zip.{i + 1:03d}"
-                chunk = src.read(chunk_size)
 
+                # Stream the chunk into the ZIP in 1 MB pieces instead of
+                # reading up to SPLIT_SIZE_MB (1.9 GB) into RAM — the old
+                # `src.read(chunk_size)` could OOM small servers (Railway).
                 with zipfile.ZipFile(part_path, "w", zipfile.ZIP_STORED) as zf:
-                    zf.writestr(f"chunk_{i + 1:03d}", chunk)
+                    with zf.open(f"chunk_{i + 1:03d}", "w") as out:
+                        remaining = chunk_size
+                        while remaining > 0:
+                            piece = src.read(min(1 << 20, remaining))
+                            if not piece:
+                                break
+                            out.write(piece)
+                            remaining -= len(piece)
 
                 parts.append(part_path)
                 logger.debug("  Part %d/%d: %s", i + 1, total_chunks, Path(part_path).name)

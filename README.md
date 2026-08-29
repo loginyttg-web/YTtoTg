@@ -154,14 +154,31 @@ Required credentials:
 > `cookies.txt` is also auto-detected when sent directly—even after the bot has
 > restarted. The bot immediately acknowledges receipt, validates YouTube rows,
 > and atomically replaces the old file only when the new export is valid.
+>
+> **Env-variable alternative (Railway):** set `COOKIES_CONTENT` to the raw
+> **Netscape** cookie export text. On the first start where no cookie file
+> exists yet, the bot validates and writes it to the managed path (your volume).
+> An existing file — e.g. one uploaded via `/cookies` — always wins, so the env
+> value is only a first-run seed. JSON exports are **not** supported by yt-dlp,
+> so don't paste Chrome's JSON format there.
 
 ## 🚂 Deploy on Railway (recommended)
 
-1. **Push this repo to GitHub** (already done) → [railway.app](https://railway.app) →
-   **New Project → Deploy from GitHub repo**.
-2. **Add a Volume** — right-click the service → *Add Volume* → mount path **`/data`**.
+The repo ships a **Dockerfile** (Python 3.11 + Node.js for yt-dlp's JS challenge +
+ffmpeg) and a `railway.json` that selects it — no build config needed.
+
+1. **Push this repo to GitHub** → [railway.app](https://railway.app) →
+   **New Project → Deploy from GitHub repo** → pick this repo.
+2. **Service → Settings** — leave everything at defaults:
+   | Field | Value |
+   |---|---|
+   | Root Directory | *(empty — repo root)* |
+   | Builder | `Dockerfile` *(auto from railway.json)* |
+   | Build Command | *(empty — Dockerfile builds it)* |
+   | Start Command | *(empty — uses `python ytbot/main.py`)* |
+3. **Add a Volume** — right-click the service → *Add Volume* → mount path **`/data`**.
    _(Without a volume, state/cookies vanish on every redeploy!)_
-3. **Set these Variables** (service → Variables tab):
+4. **Set these Variables** (service → Variables tab):
 
    | Variable | Value — where to get it |
    |---|---|
@@ -177,16 +194,15 @@ Required credentials:
    | `UPLOAD_QUEUE_LIMIT` | `3` _(download backpressure cap)_ |
    | `WATCH_INTERVAL_MIN` | `30` _(auto-watch default)_ |
    | `DEFAULT_QUALITY` | `best` |
+   | `COOKIES_CONTENT` | *(optional)* the raw **Netscape** `cookies.txt` export text — the bot validates & writes it on first start |
 
-4. **Deploy.** After the startup ping arrives, send `/cookies` and attach your
+5. **Deploy.** After the startup ping arrives, send `/cookies` and attach your
    `cookies.txt` as a **File/Document** (reply is optional). It is saved on the
-   volume and survives redeploys.
-5. `/watch <channel> <DEST_CHAT_ID>` and you're fully automatic.
+   volume and survives redeploys. (No upload needed if you set `COOKIES_CONTENT`.)
+6. `/watch <channel> <DEST_CHAT_ID>` and you're fully automatic.
 
-The repo ships `railway.json` + `nixpacks.toml` (Python 3.11 + Node.js for
-yt-dlp + ffmpeg) — no extra build setup needed. Railway runs the bot as a
-worker with `restartPolicyType: ALWAYS`, so crashes auto-restart; the queue
-persists in `state.json` on the volume.
+Railway runs the bot with `restartPolicyType: ALWAYS` (from `railway.json`), so
+crashes auto-restart; the queue persists in `state.json` on the volume.
 
 > 💸 Note: a 24/7 bot consumes ~720 h/month of Railway usage — the free trial
 > won't cover it, the Hobby plan does.

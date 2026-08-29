@@ -8,7 +8,6 @@ import os
 import shutil
 import signal
 import sys
-import time
 from datetime import datetime
 
 # ── Ensure node.js is on PATH so yt-dlp can solve YouTube's n-challenge ──
@@ -25,6 +24,7 @@ from utils.helpers import human_bytes
 from core.state import StateManager
 from core.system import cleanup_temp, disk_report, is_disk_alert
 from core.downloader import (
+    DynamicSemaphore,
     download_worker,
     get_bot_detection_alerted,
     reset_bot_alert,
@@ -314,6 +314,16 @@ async def main() -> None:
         Config.COOKIES_PATH = str(_cookies_default)
         logger.info("Auto-loaded cookies from %s", _cookies_default)
 
+    # 5b. First-run bootstrap from the COOKIES_CONTENT env var (Netscape text).
+    #     Only writes when NO valid cookie file is active, so an existing file
+    #     (Telegram /cookies upload or manual copy) is never overwritten.
+    if not Config.COOKIES_PATH:
+        from core.auth import bootstrap_cookies_from_env
+        seeded = bootstrap_cookies_from_env()
+        if seeded:
+            Config.COOKIES_PATH = seeded
+            logger.info("Using cookies seeded from COOKIES_CONTENT: %s", seeded)
+
     # 6. Create Pyrogram client
     app = create_app()
 
@@ -331,14 +341,17 @@ async def main() -> None:
     await _send_startup_ping(app)
 
     # 6. Launch background tasks
-    semaphore = asyncio.Semaphore(Config.PARALLEL_DOWNLOADS)
+    # A fixed pool of up to 5 download workers shares a dynamic semaphore whose
+    # limit is read live from state.settings — so `/setparallel` changes the
+    # actual concurrency immediately instead of only on restart.
+    semaphore = DynamicSemaphore(state)
     background_tasks: list[asyncio.Task] = []
 
     # State autosave
     background_tasks.append(asyncio.create_task(state.autosave_loop(15, stop_event)))
 
-    # Download workers
-    for w_id in range(Config.PARALLEL_DOWNLOADS):
+    # Download workers (pool of 5; the semaphore enforces the configured limit)
+    for w_id in range(5):
         background_tasks.append(
             asyncio.create_task(download_worker(w_id + 1, semaphore, stop_event, state))
         )
