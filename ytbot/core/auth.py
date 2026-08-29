@@ -397,6 +397,41 @@ def active_cookie_path() -> Optional[Path]:
     return None
 
 
+def bootstrap_cookies_from_env() -> Optional[str]:
+    """Seed the managed cookie file from ``COOKIES_CONTENT`` (Netscape text).
+
+    Called once at startup when **no** valid cookie file is active yet, so:
+      • Railway users can ship cookies as an env var instead of uploading them
+      • an existing file (uploaded via ``/cookies`` or copied manually) always
+        wins and is never overwritten by a stale env value
+      • invalid content is rejected before it can replace anything
+
+    Returns the path of the seeded file, or ``None`` when nothing was written.
+    """
+    content = getattr(Config, "COOKIES_CONTENT", "") or ""
+    if not content.strip():
+        return None
+    if active_cookie_path() is not None:
+        logger.info("COOKIES_CONTENT ignored — an active cookie file already exists")
+        return None
+
+    target = configured_cookie_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.envseed.tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        info = install_cookies_file(tmp, target)  # validates + atomic replace
+        logger.info("Cookies seeded from COOKIES_CONTENT env var → %s", info.path)
+        return str(info.path)
+    except (ValueError, OSError) as exc:
+        logger.error("COOKIES_CONTENT rejected: %s", exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
 def _cookie_source() -> Optional[str]:
     """
     Determine the active cookie source in priority order:

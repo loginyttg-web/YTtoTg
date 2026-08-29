@@ -184,6 +184,70 @@ class SplitterTests(unittest.TestCase):
         self.assertFalse(needs_split(str(src)))
 
 
+class CookieEnvBootstrapTests(unittest.TestCase):
+    """COOKIES_CONTENT seeds the managed file only when nothing else exists."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.old_data = Config.DATA_DIR
+        self.old_base = Config.BASE_DIR
+        self.old_cookie_path = Config.COOKIES_PATH
+        self.old_content = Config.COOKIES_CONTENT
+        Config.DATA_DIR = self.root / "data"
+        Config.BASE_DIR = self.root
+        Config.COOKIES_PATH = ""
+        Config.COOKIES_CONTENT = (
+            "# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t9999999999\tSAPISID\tenv-secret\n"
+        )
+
+    def tearDown(self) -> None:
+        Config.DATA_DIR = self.old_data
+        Config.BASE_DIR = self.old_base
+        Config.COOKIES_PATH = self.old_cookie_path
+        Config.COOKIES_CONTENT = self.old_content
+        self.tmp.cleanup()
+
+    def test_seeds_file_when_nothing_exists(self) -> None:
+        from core.auth import bootstrap_cookies_from_env, active_cookie_path
+        seeded = bootstrap_cookies_from_env()
+        self.assertIsNotNone(seeded)
+        path = Path(seeded)
+        self.assertEqual(path, active_cookie_path())
+        self.assertEqual(path, Config.DATA_DIR / "cookies.txt")
+        self.assertIn("SAPISID", path.read_text(encoding="utf-8"))
+
+    def test_existing_valid_file_wins(self) -> None:
+        from core.auth import bootstrap_cookies_from_env
+        existing = Config.DATA_DIR
+        existing.mkdir(parents=True, exist_ok=True)
+        target = existing / "cookies.txt"
+        target.write_text(
+            "# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t9999999999\tSAPISID\tkeep-me\n",
+            encoding="utf-8",
+        )
+        seeded = bootstrap_cookies_from_env()
+        self.assertIsNone(seeded)
+        self.assertIn("keep-me", target.read_text(encoding="utf-8"))
+        self.assertNotIn("env-secret", target.read_text(encoding="utf-8"))
+
+    def test_invalid_content_is_rejected_and_writes_nothing(self) -> None:
+        from core.auth import bootstrap_cookies_from_env
+        Config.COOKIES_CONTENT = "not a cookie export at all"
+        seeded = bootstrap_cookies_from_env()
+        self.assertIsNone(seeded)
+        target = Config.DATA_DIR / "cookies.txt"
+        self.assertFalse(target.exists())
+        self.assertEqual(Config.DATA_DIR, Config.DATA_DIR)  # no partial writes
+
+    def test_empty_content_is_noop(self) -> None:
+        from core.auth import bootstrap_cookies_from_env
+        Config.COOKIES_CONTENT = ""
+        self.assertIsNone(bootstrap_cookies_from_env())
+
+
 class HandlerMessageFormatTests(unittest.TestCase):
     """User-facing replies must use real newlines, not literal backslash-n."""
 

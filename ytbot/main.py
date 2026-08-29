@@ -314,6 +314,16 @@ async def main() -> None:
         Config.COOKIES_PATH = str(_cookies_default)
         logger.info("Auto-loaded cookies from %s", _cookies_default)
 
+    # 5b. First-run bootstrap from the COOKIES_CONTENT env var (Netscape text).
+    #     Only writes when NO valid cookie file is active, so an existing file
+    #     (Telegram /cookies upload or manual copy) is never overwritten.
+    if not Config.COOKIES_PATH:
+        from core.auth import bootstrap_cookies_from_env
+        seeded = bootstrap_cookies_from_env()
+        if seeded:
+            Config.COOKIES_PATH = seeded
+            logger.info("Using cookies seeded from COOKIES_CONTENT: %s", seeded)
+
     # 6. Create Pyrogram client
     app = create_app()
 

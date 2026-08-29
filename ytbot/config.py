@@ -100,6 +100,12 @@ class Config:
     # --- YouTube Anti-Bot / Authentication ---
     # Path to cookies.txt (Netscape format) — export from browser
     COOKIES_PATH: str = os.getenv("COOKIES_PATH", "")
+    # Netscape-format cookie export as raw text. On first startup (when no
+    # cookie file exists yet) the bot writes this to the managed cookie path,
+    # validates it, and uses it — handy for Railway variables instead of the
+    # Telegram /cookies upload. JSON exports are NOT supported (yt-dlp only
+    # reads Netscape files). An existing file always wins over this env var.
+    COOKIES_CONTENT: str = os.getenv("COOKIES_CONTENT", "")
     # Path to browser executable for auto-cookie extraction (e.g. "chrome", "firefox")
     COOKIES_FROM_BROWSER: str = os.getenv("COOKIES_FROM_BROWSER", "")
     # OAuth2 is no longer supported by YouTube (removed 2024). Left for reference only.

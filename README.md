@@ -154,6 +154,13 @@ Required credentials:
 > `cookies.txt` is also auto-detected when sent directly—even after the bot has
 > restarted. The bot immediately acknowledges receipt, validates YouTube rows,
 > and atomically replaces the old file only when the new export is valid.
+>
+> **Env-variable alternative (Railway):** set `COOKIES_CONTENT` to the raw
+> **Netscape** cookie export text. On the first start where no cookie file
+> exists yet, the bot validates and writes it to the managed path (your volume).
+> An existing file — e.g. one uploaded via `/cookies` — always wins, so the env
+> value is only a first-run seed. JSON exports are **not** supported by yt-dlp,
+> so don't paste Chrome's JSON format there.
 
 ## 🚂 Deploy on Railway (recommended)
 
