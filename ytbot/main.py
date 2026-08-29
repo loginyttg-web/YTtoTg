@@ -8,7 +8,6 @@ import os
 import shutil
 import signal
 import sys
-import time
 from datetime import datetime
 
 # ── Ensure node.js is on PATH so yt-dlp can solve YouTube's n-challenge ──
@@ -25,6 +24,7 @@ from utils.helpers import human_bytes
 from core.state import StateManager
 from core.system import cleanup_temp, disk_report, is_disk_alert
 from core.downloader import (
+    DynamicSemaphore,
     download_worker,
     get_bot_detection_alerted,
     reset_bot_alert,
@@ -331,14 +331,17 @@ async def main() -> None:
     await _send_startup_ping(app)
 
     # 6. Launch background tasks
-    semaphore = asyncio.Semaphore(Config.PARALLEL_DOWNLOADS)
+    # A fixed pool of up to 5 download workers shares a dynamic semaphore whose
+    # limit is read live from state.settings — so `/setparallel` changes the
+    # actual concurrency immediately instead of only on restart.
+    semaphore = DynamicSemaphore(state)
     background_tasks: list[asyncio.Task] = []
 
     # State autosave
     background_tasks.append(asyncio.create_task(state.autosave_loop(15, stop_event)))
 
-    # Download workers
-    for w_id in range(Config.PARALLEL_DOWNLOADS):
+    # Download workers (pool of 5; the semaphore enforces the configured limit)
+    for w_id in range(5):
         background_tasks.append(
             asyncio.create_task(download_worker(w_id + 1, semaphore, stop_event, state))
         )

@@ -25,7 +25,7 @@ from pyrogram.types import Message, CallbackQuery
 from config import Config, quality_label
 from core.scraper import scan, sort_items, generate_txt, date_range_of, total_duration_secs
 from core.state import (
-    StateManager, PENDING, ROLE_OWNER, ROLE_ADMIN, ROLE_USER, ROLE_ICON,
+    StateManager, ROLE_OWNER, ROLE_ADMIN, ROLE_USER, ROLE_ICON,
 )
 from core.system import (
     disk_report as sys_disk_report,
@@ -244,7 +244,6 @@ async def cmd_status(client: Client, message: Message):
     c      = state.counts()
     paused = state.settings.get("paused", False)
     pq     = state.settings["parallel_downloads"]
-    q      = state.settings.get("quality", "best")
     total  = c["total"]
     done   = c["completed"] + c["failed"] + c["skipped"] + c["cancelled"]
 
@@ -725,8 +724,8 @@ async def cmd_syncfrom(client: Client, message: Message):
     idx = next((i for i, it in enumerate(ordered) if it.get("id") == marker_vid), None)
     if idx is None:
         await wait_msg.edit(
-            f"❌ Marker video not found in the channel's upload list.\n"
-            f"_It may be deleted, a Short, or from another tab._"
+            "❌ Marker video not found in the channel's upload list.\n"
+            "_It may be deleted, a Short, or from another tab._"
         )
         return
 
@@ -1151,9 +1150,8 @@ async def cmd_setrole(client: Client, message: Message):
 
 
 def _users_text() -> str:
-    owner_name = "You"
     lines = [
-        f"❖ **𝗔𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱 𝗨𝘀𝗲𝗿𝘀**",
+        "❖ **𝗔𝘂𝘁𝗵𝗼𝗿𝗶𝘇𝗲𝗱 𝗨𝘀𝗲𝗿𝘀**",
         SEP,
         f"👑 Owner: `{Config.OWNER_ID}`",
     ]
@@ -1345,11 +1343,11 @@ async def on_owner_photo(client: Client, message: Message):
     caption = (message.caption or "").casefold()
     if pending or "cookie" in caption:
         await message.reply(
-            "📷 **Photos are not accepted for cookie uploads.**\\n\\n"
-            "Please send the `.txt` file as a **File/Document**:\\n"
-            "1. Tap the 📎 attachment icon\\n"
-            "2. Choose **File** (not Gallery)\\n"
-            "3. Select your `cookies.txt`\\n\\n"
+            "📷 **Photos are not accepted for cookie uploads.**\n\n"
+            "Please send the `.txt` file as a **File/Document**:\n"
+            "1. Tap the 📎 attachment icon\n"
+            "2. Choose **File** (not Gallery)\n"
+            "3. Select your `cookies.txt`\n\n"
             "_This ensures the file arrives unchanged._",
             reply_markup=kb_auth(waiting=bool(pending)),
         )
@@ -1373,10 +1371,10 @@ async def on_owner_document(client: Client, message: Message):
         if doc:
             name = (doc.file_name or "").strip()
             await message.reply(
-                f"📎 **`{md_escape(name)}`** was not recognised as a cookie file.\\n\\n"
-                "To upload cookies:\\n"
-                "1. Run `/cookies` first, then send the `.txt` as a **File/Document**\\n"
-                "2. Or send a file whose name contains `cookie` (e.g. `cookies.txt`)\\n\\n"
+                f"📎 **`{md_escape(name)}`** was not recognised as a cookie file.\n\n"
+                "To upload cookies:\n"
+                "1. Run `/cookies` first, then send the `.txt` as a **File/Document**\n"
+                "2. Or send a file whose name contains `cookie` (e.g. `cookies.txt`)\n\n"
                 "_Send the export as a Telegram **File/Document**, not as a photo or pasted text._",
                 reply_markup=kb_auth(waiting=bool(_pending_cookie_upload(message.chat.id))),
             )
@@ -1706,8 +1704,17 @@ async def cmd_setparallel(client: Client, message: Message):
         await message.reply("❌ Must be 1–5.")
         return
     state.settings["parallel_downloads"] = n
+    # The download pool always keeps up to 5 workers alive and gates real
+    # concurrency on this setting via a dynamic semaphore, so the change is
+    # applied immediately — no restart needed. Keep Config/env in sync too so
+    # a later restart (or the startup log) sees the same value.
+    Config.PARALLEL_DOWNLOADS = n
+    os.environ["PARALLEL_DOWNLOADS"] = str(n)
     state.mark_dirty()
-    await message.reply(f"⚡ Parallel downloads → `{n}` workers")
+    await message.reply(
+        f"⚡ Parallel downloads → `{n}` workers\n"
+        f"_Applied immediately — already-running downloads finish first._"
+    )
 
 
 VALID_QUALITIES = ("best", "2160", "1440", "1080", "720", "480", "audio")
@@ -1829,7 +1836,7 @@ async def cmd_setusername(client: Client, message: Message):
             )
             return
 
-    if not re.fullmatch(r"[A-Za-z0-9_]{4,32}", uname):
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", uname):
         await message.reply("❌ Invalid username (5–32 chars: letters, numbers, `_`).")
         return
 
@@ -2710,18 +2717,12 @@ async def on_callback(client: Client, cq: CallbackQuery):
         elif action == "cancel":
             if not await _cb_require(cq, ROLE_OWNER, ROLE_ADMIN):
                 return
-            # Discard cached items (used when user taps Discard on scan result)
+            # "🗑 Discard" on a scan result — the scanned items are only in
+            # _scanned_items_cache until Start is tapped, so discarding must
+            # NOT touch the running queue. (Cancelling everything is
+            # `/resetqueue`.)
             _scanned_items_cache.pop(chat_id, None)
-            removed = 0
-            for t in list(state.all_tasks()):
-                if t.status in ACTIVE_STATUSES:
-                    trigger_cancel(t.id)
-                    state.cancel_and_remove(t.id)
-                    removed += 1
-            if removed:
-                await cq.answer(f"🚫 {removed} tasks removed", show_alert=True)
-            else:
-                await cq.answer("✖️ Discarded")
+            await cq.answer("✖️ Discarded")
 
         elif action == "auth":
             if not await _cb_require(cq, ROLE_OWNER, ROLE_ADMIN):

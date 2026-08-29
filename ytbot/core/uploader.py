@@ -18,9 +18,9 @@ from pyrogram.errors import FloodWait
 
 from config import Config
 from core.splitter import needs_split, split_to_zip_parts, cleanup_parts
-from core.state import Task, UPLOADING, StateManager
+from core.state import Task, StateManager
 from core.system import safe_delete
-from utils.helpers import human_bytes, eta_from_speed, md_escape, short
+from utils.helpers import human_bytes, eta_from_speed, md_escape
 
 logger = logging.getLogger("uploader")
 
@@ -95,7 +95,7 @@ def signature_preview(cfg: Dict[str, Any], video_num: int = 1) -> str:
             bits.append("Uploaded by " + " ".join(who))
     if not bits:
         return ""
-    return f"━━━━━━━━━━━━━━━━━━━━\n⚡ " + " · ".join(bits)
+    return "━━━━━━━━━━━━━━━━━━━━\n⚡ " + " · ".join(bits)
 
 
 def _build_caption(task: Task, video_num: int = 0,

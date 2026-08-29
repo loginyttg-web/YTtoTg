@@ -21,11 +21,48 @@ from core.auth import (
     is_bot_detection_error,
     is_rate_limit_error,
 )
-from core.state import Task, DOWNLOADING, DOWNLOADED, PENDING, FAILED, StateManager
+from core.state import Task, DOWNLOADING, DOWNLOADED, PENDING, StateManager
 from core.system import has_space_for
-from utils.helpers import sanitize_filename, human_bytes, eta_from_speed
+from utils.helpers import sanitize_filename, human_bytes
 
 logger = logging.getLogger("downloader")
+
+
+# ---------------------------------------------------------------------------
+# Dynamic semaphore — the download limit is read live from settings, so
+# /setparallel takes effect immediately without restarting workers.
+# ---------------------------------------------------------------------------
+class DynamicSemaphore:
+    """Async semaphore whose limit is ``state.settings['parallel_downloads']``.
+
+    A fixed pool of download workers (up to 5) shares one of these; workers
+    that exceed the current limit simply wait. Lowering the limit does not
+    preempt already-running downloads — it only gates new ones.
+    """
+
+    def __init__(self, state: "StateManager") -> None:
+        self._state = state
+        self._active = 0
+        self._lock = asyncio.Lock()
+
+    def _limit(self) -> int:
+        try:
+            return int(self._state.settings.get(
+                "parallel_downloads", Config.PARALLEL_DOWNLOADS))
+        except (TypeError, ValueError):
+            return max(1, Config.PARALLEL_DOWNLOADS)
+
+    async def __aenter__(self) -> "DynamicSemaphore":
+        while True:
+            async with self._lock:
+                if self._active < self._limit():
+                    self._active += 1
+                    return self
+            await asyncio.sleep(0.2)
+
+    async def __aexit__(self, *exc) -> None:
+        async with self._lock:
+            self._active = max(0, self._active - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +306,7 @@ def _download_yt_thumbnail(video_id: str, out_dir: Path) -> str:
     Falls back to ffmpeg frame extraction if all URLs fail.
     Returns absolute thumb path, or '' on total failure.
     """
-    import urllib.request, subprocess
+    import urllib.request
 
     thumb_path = out_dir.resolve() / f"{video_id}_thumb.jpg"
 
